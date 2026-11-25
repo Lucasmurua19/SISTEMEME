@@ -1,0 +1,31 @@
+# secretos y entorno
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+
+# bases locales
+*.db
+*.sqlite3
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# editor / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

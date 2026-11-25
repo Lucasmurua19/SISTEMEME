@@ -1,0 +1,7 @@
+# Opcional: publica PostgreSQL en 127.0.0.1 para usar psql o un cliente gráfico.
+#   docker compose -f compose.yaml -f compose.db-port.yaml up --build
+# El puerto por defecto es 55432 (no 5432) para no chocar con un PostgreSQL instalado en tu máquina.
+services:
+  db:
+    ports:
+      - "127.0.0.1:${DB_PORT:-55432}:5432"

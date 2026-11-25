@@ -1,0 +1,95 @@
+# Arranque local:  docker compose up --build
+# Orden: db (healthcheck) → migrate (alembic upgrade head, termina) → worker y api → web.
+name: radar-solana
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-radar}:${POSTGRES_PASSWORD:-radar}@db:5432/${POSTGRES_DB:-radar}
+  DATA_MODE: ${DATA_MODE:-fixtures}
+  SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
+  SOLANA_WS_URL: ${SOLANA_WS_URL:-}
+  JUPITER_API_KEY: ${JUPITER_API_KEY:-}
+  COMMITMENT: ${COMMITMENT:-confirmed}
+  PUMP_MIGRATION_ACCOUNT: ${PUMP_MIGRATION_ACCOUNT:-39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg}
+  STRATEGY_CONFIG_PATH: ${STRATEGY_CONFIG_PATH:-}
+  TICK_SECONDS: ${TICK_SECONDS:-2}
+  FIXTURE_STEP_SECONDS: ${FIXTURE_STEP_SECONDS:-15}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-radar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-radar}
+      POSTGRES_DB: ${POSTGRES_DB:-radar}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # La base NO se publica en la máquina: la API y el worker la alcanzan por la red interna de Compose.
+    # Para conectarte desde afuera (psql, DBeaver) usá el archivo opcional compose.db-port.yaml.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-radar} -d ${POSTGRES_DB:-radar}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *backend-env
+      WORKER_ID: worker-1
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # En modo live se puede escalar (--scale worker=2): el reclamo de trabajos usa SKIP LOCKED y las
+    # reservas de capital bloquean la fila de la sesión. En modo fixtures dejá una sola instancia
+    # (el reloj de reproducción vive en el proceso).
+
+  api:
+    build: ./backend
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *backend-env
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-300}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    environment:
+      API_INTERNAL_URL: ${API_INTERNAL_URL:-http://api:8000}
+      POLL_SECONDS: ${POLL_SECONDS:-5}
+      PANEL_CONTROLS: ${PANEL_CONTROLS:-false}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
