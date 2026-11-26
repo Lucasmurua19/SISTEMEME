@@ -8,10 +8,14 @@ las reservas, el precio, la dirección del swap y las billeteras con flujo neto 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from itertools import islice
 from typing import Any
 
 from app.application.ports import Clock
@@ -20,6 +24,7 @@ from app.infrastructure.solana_rpc import SolanaRpcClient, parse_pool_account
 
 log = logging.getLogger(__name__)
 
+CONC_BACKOFF_MAX_S = 600
 BURN_ADDRESSES = frozenset({"1nc1nerator11111111111111111111111111111111", "11111111111111111111111111111111"})
 
 
@@ -142,11 +147,13 @@ class _PoolState:
     quote_vault: str
     swaps: list[SwapRecord] = field(default_factory=list)
     unparsed_at: list[datetime] = field(default_factory=list)
-    last_sig: str | None = None
+    head_sig: str | None = None  # firma más nueva ya listada
+    backlog: deque[dict[str, Any]] = field(default_factory=deque)  # listadas y sin procesar, de la más antigua a la más nueva
     complete_until: datetime | None = None
     conc: Decimal | None = None
     conc_at: datetime | None = None
     next_conc_at: datetime | None = None
+    conc_failures: int = 0
 
 
 class SolanaMarketSource:
@@ -162,6 +169,9 @@ class SolanaMarketSource:
         settle_s: int = 2,
         max_tx_per_poll: int = 80,
         concentration_refresh_s: int = 60,
+        poll_budget_s: float | None = None,
+        concurrency: int = 1,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._rpc = rpc
         self._clock = clock
@@ -170,6 +180,14 @@ class SolanaMarketSource:
         self._settle = settle_s
         self._max_tx = max_tx_per_poll
         self._conc_every = concentration_refresh_s
+        # Tope de tiempo real por sondeo de un pool: con un RPC lento, 80 transacciones pueden tardar minutos y
+        # bloquear el ciclo. Lo que no alcanza queda para el próximo ciclo; las ventanas se arman hasta lo procesado.
+        self._poll_budget_s = poll_budget_s
+        self._mono = monotonic
+        # Lectura concurrente de transacciones: con un proveedor de cupo alto multiplica el rendimiento de un pool
+        # caliente, cuyo tráfico supera lo que una sola conexión secuencial (~5 tx/s) puede leer.
+        self._concurrency = max(1, concurrency)
+        self._executor = ThreadPoolExecutor(max_workers=self._concurrency, thread_name_prefix="rpc-tx") if self._concurrency > 1 else None
         self._pools: dict[str, _PoolState] = {}
 
     # ------------------------------------------------------------------ estado por pool
@@ -186,42 +204,58 @@ class SolanaMarketSource:
             self._pools[pool.address] = st
         return st
 
+    def _fetch_many(self, signatures: list[str]) -> list[dict[str, Any] | None]:
+        """Transacciones de ``signatures`` en el mismo orden; en paralelo si ``concurrency`` > 1."""
+        if len(signatures) <= 1 or self._executor is None:
+            return [self._rpc.get_transaction(s) for s in signatures]
+        return list(self._executor.map(self._rpc.get_transaction, signatures))
+
     def _poll(self, pool: PoolInfo, st: _PoolState) -> None:
         started = self._clock.now()
-        collected: list[dict[str, Any]] = []
+        # Solo se listan las firmas posteriores a la más nueva ya vista. Antes se volvía a pedir todo lo pendiente en
+        # cada ciclo: en un pool caliente son páginas de 1000 firmas por ciclo y el listado dominaba el tiempo.
+        new: list[dict[str, Any]] = []
         before: str | None = None
         for _ in range(10):
-            page = self._rpc.get_signatures_for_address(st.quote_vault, before=before, until=st.last_sig, limit=1000)
-            collected.extend(page)
+            page = self._rpc.get_signatures_for_address(st.quote_vault, before=before, until=st.head_sig, limit=1000)
+            new.extend(page)
             if len(page) < 1000:
                 break
             before = page[-1]["signature"]
+        if new:
+            st.head_sig = new[0]["signature"]  # el RPC devuelve de la más nueva a la más vieja
+            st.backlog.extend(reversed(new))  # el pendiente se procesa de la más antigua a la más reciente
 
-        drained = True
         processed = 0
-        for entry in reversed(collected):  # de la más antigua a la más reciente
-            if processed >= self._max_tx:
-                drained = False
+        deadline = None if self._poll_budget_s is None else self._mono() + self._poll_budget_s
+        stalled = False
+        while st.backlog and not stalled:
+            if processed >= self._max_tx or (deadline is not None and self._mono() > deadline):
                 break
-            sig = entry["signature"]
-            if entry.get("err") is None:
-                tx = self._rpc.get_transaction(sig)
-                if tx is None:
-                    drained = False
-                    break
-                try:
-                    rec = extract_swap(
-                        tx, pool_address=pool.address, mint=pool.mint, base_vault=st.base_vault,
-                        quote_vault=st.quote_vault, decimals=pool.decimals,
-                    )  # fmt: skip
-                except (KeyError, ValueError, TypeError):
-                    st.unparsed_at.append(datetime.fromtimestamp(tx.get("blockTime") or 0, UTC))
-                    rec = None
-                if rec is not None:
-                    st.swaps.append(rec)
-                processed += 1
-            st.last_sig = sig
-        if drained:
+            # Se leen varias transacciones a la vez (``concurrency``) pero se aplican en orden estricto: el estado del
+            # pool solo avanza hasta la primera transacción que todavía no está disponible.
+            batch = list(islice(st.backlog, max(1, min(self._concurrency, self._max_tx - processed))))
+            wanted = [e["signature"] for e in batch if e.get("err") is None]
+            fetched = dict(zip(wanted, self._fetch_many(wanted), strict=True))
+            for entry in batch:
+                if entry.get("err") is None:
+                    tx = fetched[entry["signature"]]
+                    if tx is None:
+                        stalled = True  # queda al frente del pendiente y se reintenta en el próximo ciclo
+                        break
+                    try:
+                        rec = extract_swap(
+                            tx, pool_address=pool.address, mint=pool.mint, base_vault=st.base_vault,
+                            quote_vault=st.quote_vault, decimals=pool.decimals,
+                        )  # fmt: skip
+                    except (KeyError, ValueError, TypeError):
+                        st.unparsed_at.append(datetime.fromtimestamp(tx.get("blockTime") or 0, UTC))
+                        rec = None
+                    if rec is not None:
+                        st.swaps.append(rec)
+                    processed += 1
+                st.backlog.popleft()
+        if not st.backlog:
             st.complete_until = started - timedelta(seconds=self._settle)
         elif st.swaps:
             st.complete_until = st.swaps[-1].at
@@ -229,12 +263,19 @@ class SolanaMarketSource:
     def _refresh_concentration(self, pool: PoolInfo, st: _PoolState, now: datetime) -> None:
         if st.next_conc_at is not None and now < st.next_conc_at:
             return
-        st.next_conc_at = now + timedelta(seconds=self._conc_every)
         try:
             value = compute_concentration(self._rpc, pool.mint, pool.address, frozenset({st.base_vault, st.quote_vault}))
         except Exception as exc:  # el dato queda como desconocido en lugar de inventarse
-            log.warning("concentración no disponible para %s: %s", pool.mint[:6], type(exc).__name__)
+            # Cada fallo duplica la espera hasta el próximo intento (tope CONC_BACKOFF_MAX_S): con un proveedor que
+            # limita la tasa de esta llamada, insistir cada minuto solo agrega carga y retrasa el resto del ciclo.
+            st.conc_failures += 1
+            wait = min(CONC_BACKOFF_MAX_S, self._conc_every * 2 ** (st.conc_failures - 1))
+            st.next_conc_at = now + timedelta(seconds=wait)
+            if st.conc_failures == 1:  # una advertencia por pool; los reintentos siguientes no repiten el aviso
+                log.warning("concentración no disponible para %s: %s (se reintenta con espera creciente)", pool.mint[:6], type(exc).__name__)
             return
+        st.next_conc_at = now + timedelta(seconds=self._conc_every)
+        st.conc_failures = 0
         if value is not None:
             st.conc, st.conc_at = value, now
 

@@ -16,7 +16,7 @@ from typing import Any
 
 from .config import StrategyConfig
 from .costs import compute_round_trip
-from .models import HUNDRED, LAMPORTS_PER_SOL, ZERO, MarketSnapshot, Quote, QuoteStatus, RoundTrip
+from .models import HUNDRED, LAMPORTS_PER_SOL, WSOL_MINT, ZERO, MarketSnapshot, Quote, QuoteStatus, RoundTrip
 from .reasons import CandidateStatus, FilterOutcome, Reason, ReasonCode
 
 # --------------------------------------------------------------------------- patrón
@@ -238,6 +238,7 @@ class EvaluationInput:
     as_of: datetime
     buy_quote: Quote | None = None
     sell_quote: Quote | None = None
+    quote_mint: str = WSOL_MINT  # el radar solo modela pools cotizados en SOL (precio, liquidez y costos en SOL)
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ _PENDING = _STALE_DATA | {
 _TERMINAL_REJECT = {
     ReasonCode.MIGRATION_UNVERIFIED,
     ReasonCode.IDENTITY_MISMATCH,
+    ReasonCode.UNSUPPORTED_QUOTE_MINT,
     ReasonCode.DRAWDOWN_TOO_DEEP,
 }
 _EXPIRED = {ReasonCode.PATTERN_EXPIRED, ReasonCode.PATTERN_INVALIDATED}
@@ -400,6 +402,14 @@ def evaluate(inp: EvaluationInput, cfg: StrategyConfig) -> EvaluationResult:
         "mint y pool coinciden con la migración observada"
         if inp.identity_ok
         else "el mint y el pool no coinciden con la migración observada",
+    )
+    quote_ok = inp.quote_mint == WSOL_MINT
+    add(
+        "quote_mint",
+        ReasonCode.UNSUPPORTED_QUOTE_MINT,
+        P if quote_ok else F,
+        "el pool cotiza en SOL" if quote_ok else "el pool cotiza en otro token, no en SOL: fuera del alcance del radar",
+        value=None if quote_ok else inp.quote_mint,
     )
     age_ok = age_s <= Decimal(cfg.max_age_after_migration_s)
     add(

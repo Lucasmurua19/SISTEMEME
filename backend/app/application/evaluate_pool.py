@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import logging
+import random
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 
-from app.application.ports import Clock, MarketDataSource, QuoteProvider, UnitOfWorkFactory
+from app.application.ports import (
+    Clock,
+    MarketDataSource,
+    QuoteProvider,
+    TransientSourceError,
+    UnitOfWorkFactory,
+)
 from app.domain.config import StrategyConfig
 from app.domain.models import PoolInfo, Quote, QuoteStatus
 from app.domain.reasons import CandidateStatus
@@ -35,15 +44,32 @@ def evaluate_pools(
     clock: Clock,
     version_id: int,
     cfg: StrategyConfig,
+    budget_s: float | None = None,
+    progress: Callable[[], None] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    shuffle: Callable[[list[PoolInfo]], None] = random.shuffle,
 ) -> list[EvaluationOutcome]:
-    """Evalúa la última ventana cerrada de cada pool activo (una evaluación por pool, ventana y versión)."""
+    """Evalúa la última ventana cerrada de cada pool activo (una evaluación por pool, ventana y versión).
+
+    Con ``budget_s`` el trabajo del ciclo tiene un tope de tiempo real: al agotarse no se empiezan más pools y el
+    resto queda para el próximo ciclo. Con un RPC lento esto evita que la evaluación bloquee el latido, los trabajos
+    y el seguimiento de posiciones abiertas. Como el orden fijo dejaría sin atender a los últimos pools, con
+    presupuesto se mezcla el orden en cada ciclo. Sin presupuesto (fixtures) el recorrido es completo y determinista.
+    ``progress`` se invoca después de cada pool (el worker lo usa para el latido).
+    """
     now = clock.now()
     grace = cfg.window_seconds * 2
     with uow_factory() as uow:
         pools = uow.chain.list_active_pools(now, cfg.max_age_after_migration_s + grace)
+    deadline = None if budget_s is None else monotonic() + budget_s
+    if budget_s is not None:
+        shuffle(pools)
 
     outcomes: list[EvaluationOutcome] = []
     for pool in pools:
+        if deadline is not None and outcomes and monotonic() > deadline:
+            log.info("presupuesto de evaluación agotado: %d de %d pools este ciclo", len(outcomes), len(pools))
+            break
         try:
             outcomes.append(
                 evaluate_pool(
@@ -51,10 +77,16 @@ def evaluate_pools(
                     pool=pool, version_id=version_id, cfg=cfg,
                 )  # fmt: skip
             )
+        except TransientSourceError as exc:
+            # límite de tasa o nodo lento: esperado con proveedores de cupo bajo; se reintenta en el próximo ciclo
+            log.warning("pool %s: fuente transitoria, se reintenta (%s)", pool.address[:8], exc)
+            outcomes.append(EvaluationOutcome(pool.address, None, None, None, None, error=f"TransientSourceError: {exc}"))
         except Exception as exc:
             # un pool con datos inconsistentes o una fuente caída no detiene la evaluación de los demás
             log.exception("falló la evaluación del pool %s", pool.address)
             outcomes.append(EvaluationOutcome(pool.address, None, None, None, None, error=f"{type(exc).__name__}: {exc}"))
+        if progress is not None:
+            progress()
     return outcomes
 
 
@@ -80,6 +112,7 @@ def evaluate_pool(
         migrated_at=pool.migrated_at,
         migration_verified=pool.verified,
         identity_ok=pool.identity_ok,
+        quote_mint=pool.quote_mint,
         snapshots=stored,
         as_of=now,
     )

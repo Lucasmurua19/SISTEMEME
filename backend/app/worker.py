@@ -42,6 +42,7 @@ class CycleReport:
     monitored: int = 0
     exits_triggered: int = 0
     errors: list[str] = field(default_factory=list)
+    timings: dict[str, float] = field(default_factory=dict)  # segundos por paso
 
 
 class Worker:
@@ -60,10 +61,14 @@ class Worker:
         source_max_failures: int = 3,
         job_claim_ttl_s: int = 60,
         real_clock: Clock | None = None,
+        evaluation_budget_s: float | None = None,
+        slow_step_s: float = 15.0,
     ) -> None:
         self.uow = uow_factory
         self.clock = clock
         self.real_clock = real_clock or SystemClock()
+        self.evaluation_budget_s = evaluation_budget_s  # None = evaluar todos los pools (fixtures)
+        self.slow_step_s = slow_step_s
         self.migrations = migrations
         self.market = market
         self.quotes = quotes
@@ -125,12 +130,29 @@ class Worker:
 
     # ------------------------------------------------------------------ ciclo
     def _guard(self, rep: CycleReport, step: str, fn: Callable[[], Any]) -> Any:
+        started = time.monotonic()
         try:
             return fn()
         except Exception as exc:
             log.exception("falló el paso %s", step)
             rep.errors.append(f"{step}: {type(exc).__name__}: {exc}")
             return None
+        finally:
+            took = time.monotonic() - started
+            rep.timings[step] = round(took, 2)
+            if took > self.slow_step_s:
+                log.warning("el paso %s tardó %.1f s (fuente lenta o límite de tasa del proveedor)", step, took)
+
+    def _heartbeat(self) -> None:
+        """Latido: el panel usa ``cursor`` como reloj del sistema y ``updated_at`` para saber si el worker vive.
+
+        Se emite también durante los pasos largos (entre pools), para que un RPC lento no parezca un worker caído.
+        """
+        with self.uow() as uow:
+            uow.checkpoints.save_cursor(
+                health_mod.WORKER_SOURCE, health_mod.HEARTBEAT_STREAM,
+                self.clock.now().isoformat(), None, self.real_clock.now(),
+            )  # fmt: skip
 
     def run_cycle(self) -> CycleReport:
         if isinstance(self.clock, ReplayClock):
@@ -151,6 +173,7 @@ class Worker:
             rep.ingested = res.inserted
         else:
             self._mark_failure(self.migrations.name, "migrations", rep.errors[-1])
+        self._heartbeat()
 
         # 2. snapshots, filtros, cotizaciones y ranking
         outcomes = self._guard(
@@ -158,6 +181,7 @@ class Worker:
             lambda: evaluate_pools(
                 uow_factory=self.uow, market=self.market, quotes=self.quotes, clock=self.clock,
                 version_id=self.version_id, cfg=self.cfg,
+                budget_s=self.evaluation_budget_s, progress=self._heartbeat,
             ),
         )  # fmt: skip
         for o in outcomes or []:
@@ -194,6 +218,7 @@ class Worker:
         jobs = self._guard(rep, "jobs", lambda: self.jobs.run_due())
         if jobs is not None:
             rep.jobs = jobs
+        self._heartbeat()
 
         # 6. seguimiento de posiciones abiertas (continúa aunque la sesión esté pausada o sin presupuesto)
         monitored = self._guard(
@@ -207,12 +232,8 @@ class Worker:
             rep.exits_triggered += int(m.trigger is not None and m.attempt_id is not None)
         self._record_tallies()
 
-        # 7. latido: el panel usa ``cursor`` como reloj del sistema y ``updated_at`` para saber si el worker vive
-        with self.uow() as uow:
-            uow.checkpoints.save_cursor(
-                health_mod.WORKER_SOURCE, health_mod.HEARTBEAT_STREAM,
-                self.clock.now().isoformat(), None, self.real_clock.now(),
-            )  # fmt: skip
+        # 7. latido final del ciclo
+        self._heartbeat()
         return rep
 
     # ------------------------------------------------------------------ salud
@@ -256,9 +277,9 @@ def run_forever(worker: Worker, tick_seconds: float, stop: threading.Event) -> N
             if rep.errors:
                 log.warning("ciclo con errores: %s", "; ".join(rep.errors))
             log.info(
-                "t=%s ingesta=%d evals=%d señales=%d admitidas=%d rechazadas=%d trabajos=%s monitoreadas=%d",
+                "t=%s ingesta=%d evals=%d señales=%d admitidas=%d rechazadas=%d trabajos=%s monitoreadas=%d pasos=%s",
                 rep.now.strftime("%H:%M:%S"), rep.ingested, rep.evaluations, rep.signals,
-                rep.admitted, rep.rejected, rep.jobs, rep.monitored,
+                rep.admitted, rep.rejected, rep.jobs, rep.monitored, rep.timings,
             )  # fmt: skip
         except Exception:
             log.exception("ciclo abortado")

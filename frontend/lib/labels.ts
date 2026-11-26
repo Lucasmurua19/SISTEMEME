@@ -19,6 +19,7 @@ export const STATUS_HELP: Record<string, string> = {
 export const REASON_LABEL: Record<string, string> = {
   MIGRATION_UNVERIFIED: "Migración no verificada",
   IDENTITY_MISMATCH: "Mint y pool no coinciden",
+  UNSUPPORTED_QUOTE_MINT: "Pool cotizado en otro token (no SOL)",
   NO_MARKET_DATA: "Sin datos de mercado",
   STALE_MARKET_DATA: "Datos de mercado vencidos",
   LOW_DATA_COVERAGE: "Cobertura de datos insuficiente",

@@ -189,6 +189,19 @@ class TestEvaluate:
         assert evaluate(inp(snaps, verified=False), CFG).status is CandidateStatus.REJECTED
         assert evaluate(inp(snaps, identity=False), CFG).status is CandidateStatus.REJECTED
 
+    def test_pool_quoted_in_another_token_is_rejected_with_its_own_reason(self):
+        # caso real de mainnet: migración legítima de Pump.fun cuyo pool cotiza en otro token de Pump.fun
+        snaps = build_series(VALID_CLOSES)
+        base = inp(snaps)
+        other = EvaluationInput(**{**base.__dict__, "quote_mint": "GexThZHgaswpAQ7Fi8QrHFubjPimUNSYhJiAA7XZpump"})
+        res = evaluate(other, CFG)
+        assert res.status is CandidateStatus.REJECTED
+        codes = failing_codes(res)
+        assert ReasonCode.UNSUPPORTED_QUOTE_MINT in codes
+        assert ReasonCode.IDENTITY_MISMATCH not in codes and ReasonCode.MIGRATION_UNVERIFIED not in codes  # no es un fallo de verificación
+        assert not res.needs_quote  # no se gasta ninguna cotización en algo fuera de alcance
+        assert ReasonCode.UNSUPPORTED_QUOTE_MINT not in failing_codes(evaluate(base, CFG))  # con SOL el filtro pasa
+
     def test_insufficient_depth(self):
         res = evaluate(inp(build_series(VALID_CLOSES, sol0=5_000_000_000)), CFG)
         assert ReasonCode.INSUFFICIENT_DEPTH in failing_codes(res)

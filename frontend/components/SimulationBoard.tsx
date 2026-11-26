@@ -62,7 +62,7 @@ function Headline({ m }: { m: Metrics }) {
         tone={pnlClass(m.realized_pnl_lamports)}
         sub={
           <>
-            <Line>{m.trades_closed} cerradas · solo ventas ya ejecutadas</Line>
+            <Line>{m.trades_closed} cerradas (ventas ejecutadas)</Line>
             <Line>{usdFor(m) ?? "USD: sin referencia"}</Line>
           </>
         }
@@ -80,14 +80,14 @@ function Headline({ m }: { m: Metrics }) {
               <Line>
                 {m.trades_open} abierta(s): {withRoute} con ruta de salida · {m.trades_illiquid} sin ruta
               </Line>
-              <Line>Venta al mínimo garantizado, después de costos</Line>
+              <Line>Mínimo garantizado, tras costos</Line>
               {m.trades_illiquid > 0 && (
                 <Line>
-                  Sin ruta = recuperación cero: −{formatSol(m.illiquid_cost_basis_lamports, 4)} SOL
+                  Sin ruta: recuperación cero (−{formatSol(m.illiquid_cost_basis_lamports, 4)} SOL)
                 </Line>
               )}
               {withRoute > 0 && <Line>A precio cotizado: {formatSol(m.open_pnl_quoted_lamports, 4, true)} SOL</Line>}
-              {m.open_oldest_valuation_at && <Line>Valoración más vieja: {formatClock(m.open_oldest_valuation_at)}</Line>}
+              {m.open_oldest_valuation_at && <Line>Valorada: {formatClock(m.open_oldest_valuation_at)}</Line>}
             </>
           )
         }

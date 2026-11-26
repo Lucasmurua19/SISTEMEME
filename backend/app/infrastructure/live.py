@@ -16,17 +16,37 @@ from app.settings import Settings
 log = logging.getLogger(__name__)
 
 
+PUBLIC_RPC_HOSTS = ("api.mainnet-beta.solana.com",)
+EXAMPLE_PLACEHOLDER = "TU-PROVEEDOR"  # el valor de ejemplo de .env.example: nunca es una URL real
+
+
+def check_rpc_url(rpc_url: str) -> None:
+    """Falla con un mensaje claro ante una URL vacía o de ejemplo, y avisa si es el RPC público (sin exponer la URL)."""
+    if not rpc_url or EXAMPLE_PLACEHOLDER in rpc_url:
+        raise RuntimeError(
+            "SOLANA_RPC_URL está vacía o conserva el valor de ejemplo de .env.example: configurá la URL de tu proveedor RPC"
+        )
+    if any(host in rpc_url for host in PUBLIC_RPC_HOSTS):
+        log.warning(
+            "se usa el RPC público de Solana: limita la tasa (HTTP 429, Retry-After) y no sostiene muchos pools a la vez. "
+            "Sirve para una prueba de humo; para observar de forma continua usá un proveedor con cupo propio"
+        )
+
+
 def build_live_sources(settings: Settings, uow: UnitOfWorkFactory, clock: Clock):
     rpc_url = settings.solana_rpc_url.get_secret_value()
-    if not rpc_url:
-        raise RuntimeError("SOLANA_RPC_URL es obligatoria en DATA_MODE=live")
+    check_rpc_url(rpc_url)
     rpc = SolanaRpcClient(rpc_url, commitment=settings.commitment)
-    migrations = PumpMigrationSource(rpc, clock=clock, migration_account=settings.pump_migration_account)
+    migrations = PumpMigrationSource(
+        rpc, clock=clock, migration_account=settings.pump_migration_account, budget_s=settings.ingest_budget_s
+    )
     market = SolanaMarketSource(
         rpc,
         clock=clock,
         window_seconds=15,
         concentration_refresh_s=settings.concentration_refresh_s,
+        poll_budget_s=settings.poll_budget_s,
+        concurrency=settings.rpc_concurrency,
     )
     jupiter = JupiterClient(
         settings.jupiter_base_url, settings.jupiter_api_key.get_secret_value(), max_rps=settings.jupiter_max_rps

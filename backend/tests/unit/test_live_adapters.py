@@ -1,4 +1,4 @@
-"""Adaptadores en vivo con payloads sintéticos (estructura según la documentación pública de RPC y el IDL)."""
+"""Adaptadores en vivo: payloads sintéticos (documentación pública de RPC e IDL) y transacciones reales capturadas."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import base58
 import httpx
@@ -25,7 +26,9 @@ from app.infrastructure import solana_keys
 from app.infrastructure.clock import ManualClock
 from app.infrastructure.jupiter_quotes import JupiterClient, JupiterFxProvider, JupiterQuoteProvider
 from app.infrastructure.solana_market import (
+    SolanaMarketSource,
     SwapRecord,
+    _PoolState,
     build_windows,
     compute_concentration,
     extract_swap,
@@ -101,33 +104,125 @@ def tx_with(outer, inner=None, err=None, block_time=1_772_323_200):
     }
 
 
+def create_pool_ix(mint=MINT, pool=POOL, quote=WSOL_MINT):
+    return {
+        "programId": PUMPSWAP_PROGRAM_ID,
+        "accounts": [pool, key("cfg"), key("authority"), mint, quote],
+        "data": base58.b58encode(AMM_CREATE_POOL_DISC + b"\x00" * 4).decode(),
+    }
+
+
+def migrate_tx(mint=MINT, pool=POOL, **kw):
+    """Migración real: `migrate` externa (índice 0) y, dentro, el `create_pool` de PumpSwap que ella provoca."""
+    return tx_with([migrate_ix(mint, pool)], inner=[{"index": 0, "instructions": [create_pool_ix(mint, pool)]}], **kw)
+
+
+REAL_TXS = Path(__file__).resolve().parent.parent / "fixtures" / "solana_real"
+
+
+def load_real(name: str) -> tuple[str, dict]:
+    data = json.loads((REAL_TXS / f"{name}.json").read_text())
+    return data["signature"], data["result"]
+
+
 class TestParseMigrations:
     def test_migrate_instruction_yields_mint_pool_and_identity(self):
-        (ev,) = parse_migrations(tx_with([{"programId": "Other", "accounts": [], "data": ""}, migrate_ix()]), SIG, NOW)
+        outer = [{"programId": "Other", "accounts": [], "data": ""}, migrate_ix()]
+        tx = tx_with(outer, inner=[{"index": 1, "instructions": [create_pool_ix()]}])
+        (ev,) = parse_migrations(tx, SIG, NOW)
         assert (ev.mint, ev.pool, ev.program) == (MINT, POOL, PUMP_PROGRAM_ID)
         assert (ev.signature, ev.instruction_index, ev.event_index, ev.slot) == (SIG, 1, 0, 330_000_123)
         assert ev.decimals == 6 and ev.event_at == datetime.fromtimestamp(1_772_323_200, UTC)
         assert ev.evidence["instruction"] == "migrate" and ev.evidence["quote_mint"] == WSOL_MINT
+        assert ev.evidence["outer_accounts_match"] is True
 
     def test_migrate_via_cpi_gets_a_distinct_event_index(self):
-        tx = tx_with([{"programId": "Router", "accounts": [], "data": ""}], inner=[{"index": 0, "instructions": [migrate_ix()]}])
+        tx = tx_with(
+            [{"programId": "Router", "accounts": [], "data": ""}],
+            inner=[{"index": 0, "instructions": [migrate_ix(), create_pool_ix()]}],
+        )
         (ev,) = parse_migrations(tx, SIG, NOW)
         assert (ev.instruction_index, ev.event_index) == (0, 1)
 
+    def test_migrate_that_created_no_pool_is_not_a_migration(self):
+        # reintento de un bot: la instrucción termina bien pero la curva ya estaba migrada (no hay create_pool)
+        assert parse_migrations(tx_with([migrate_ix()]), SIG, NOW) == []
+        v2 = {"programId": PUMP_PROGRAM_ID, "accounts": [key("x")] * 29, "data": base58.b58encode(MIGRATE_V2_DISC).decode()}
+        assert parse_migrations(tx_with([v2]), SIG, NOW) == []
+
+    def test_identity_comes_from_the_inner_create_pool_not_from_the_outer_accounts(self):
+        tx = tx_with([migrate_ix(mint=key("otro"), pool=key("otro-pool"))], inner=[{"index": 0, "instructions": [create_pool_ix()]}])
+        (ev,) = parse_migrations(tx, SIG, NOW)
+        assert (ev.mint, ev.pool) == (MINT, POOL) and ev.evidence["outer_accounts_match"] is False
+
     def test_v2_uses_the_inner_create_pool_accounts(self):
-        create_pool = {
-            "programId": PUMPSWAP_PROGRAM_ID,
-            "accounts": [POOL, key("cfg"), key("creator"), MINT, WSOL_MINT],
-            "data": base58.b58encode(AMM_CREATE_POOL_DISC + b"\x00" * 4).decode(),
-        }
         v2 = {"programId": PUMP_PROGRAM_ID, "accounts": [key("x")] * 5, "data": base58.b58encode(MIGRATE_V2_DISC).decode()}
-        (ev,) = parse_migrations(tx_with([v2], inner=[{"index": 0, "instructions": [create_pool]}]), SIG, NOW)
+        (ev,) = parse_migrations(tx_with([v2], inner=[{"index": 0, "instructions": [create_pool_ix()]}]), SIG, NOW)
         assert (ev.mint, ev.pool, ev.evidence["instruction"]) == (MINT, POOL, "migrate_v2")
+        assert ev.evidence["outer_accounts_match"] is False  # v2 sintético con pocas cuentas: la contraprueba lo marca
 
     def test_ignores_failed_transactions_other_programs_and_other_instructions(self):
         assert parse_migrations(tx_with([migrate_ix()], err={"InstructionError": [0, "Custom"]}), SIG, NOW) == []
         assert parse_migrations(tx_with([migrate_ix(program=key("falso"))]), SIG, NOW) == []
         assert parse_migrations(tx_with([migrate_ix(disc=bytes(8))]), SIG, NOW) == []
+
+
+class TestRealMainnetTransactions:
+    """Transacciones reales de Pump.fun capturadas de mainnet (datos públicos de la cadena).
+
+    Verifican el parser contra la realidad y no contra payloads inventados: migrate_v2 (v0 y v1), el `migrate`
+    anterior y los reintentos «Bonding curve already migrated», que son casi la mitad del tráfico de la cuenta.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "instruction", "mint", "pool"),
+        [
+            ("v0_migrate_v2_create_pool", "migrate_v2", "B8ZQPkgVHbRA9W2P8ahyLAPcgi2J7cR9ZmP6RuHypump", "22NxpuAhX8JUgxMMswe1eycvcDe9u26J5FHym9BZsWrk"),
+            ("v0_migrate_legacy_create_pool", "migrate", None, None),
+            ("v1_migrate_v2_create_pool", "migrate_v2", None, None),
+        ],
+    )
+    def test_real_migrations_are_detected_with_consistent_identity(self, name, instruction, mint, pool):
+        sig, tx = load_real(name)
+        (ev,) = parse_migrations(tx, sig, NOW)
+        assert ev.evidence["instruction"] == instruction
+        assert ev.evidence["quote_mint"] == WSOL_MINT and ev.evidence["outer_accounts_match"] is True
+        assert ev.decimals == 6 and ev.signature == sig and ev.slot == tx["slot"]
+        assert len(ev.mint) >= 32 and len(ev.pool) >= 32 and ev.mint != ev.pool
+        if mint:
+            assert (ev.mint, ev.pool) == (mint, pool)
+
+    @pytest.mark.parametrize("name", ["v0_migrate_legacy_noop", "v0_migrate_v2_noop", "v1_migrate_v2_noop"])
+    def test_real_retries_on_an_already_migrated_curve_are_not_migrations(self, name):
+        sig, tx = load_real(name)
+        assert any("already migrated" in line for line in tx["meta"]["logMessages"])
+        assert parse_migrations(tx, sig, NOW) == []
+
+    def test_the_noop_retry_targets_the_same_pool_as_the_real_migration(self):
+        # el `migrate` repetido apunta al mismo mint y pool que la migración v2 real: contarlo duplicaría la migración
+        _, noop = load_real("v0_migrate_legacy_noop")
+        sig, real = load_real("v0_migrate_v2_create_pool")
+        (ev,) = parse_migrations(real, sig, NOW)
+        retry_accounts = [a if isinstance(a, str) else a["pubkey"] for a in noop["transaction"]["message"]["instructions"][2]["accounts"]]
+        assert retry_accounts[2] == ev.mint and retry_accounts[9] == ev.pool
+
+    def test_real_migration_quoted_in_another_pump_token_is_parsed_and_verified_but_flagged(self):
+        # migración real de mainnet cuyo pool cotiza en `GexThZ…pump` y no en WSOL
+        sig, tx = load_real("v0_migrate_v2_non_sol_quote")
+        (ev,) = parse_migrations(tx, sig, NOW)
+        assert ev.evidence["quote_mint"] == "GexThZHgaswpAQ7Fi8QrHFubjPimUNSYhJiAA7XZpump" and ev.evidence["quote_mint"] != WSOL_MINT
+        assert ev.evidence["outer_accounts_match"] is True
+        real_pool = json.loads((REAL_TXS / "pool_account_non_sol_quote.json").read_text())
+        rpc = FakeRpc()
+        rpc.accounts[ev.pool] = real_pool["account"]
+        verification = PumpMigrationSource(rpc, clock=ManualClock(NOW), migration_account=key("migr")).verify(ev)
+        # la identidad es correcta (es el pool de esa migración); que no cotice en SOL se resuelve al evaluar
+        assert verification.verified and verification.identity_ok and verification.reason is None
+        assert verification.evidence["quote_mint"] == ev.evidence["quote_mint"]
+
+    def test_real_transactions_have_expected_versions(self):
+        assert load_real("v1_migrate_v2_create_pool")[1]["version"] == 1
+        assert load_real("v0_migrate_v2_create_pool")[1]["version"] == 0
 
 
 def pool_account_b64(*, mint=MINT, quote=WSOL_MINT, creator=None):
@@ -180,7 +275,7 @@ class TestMigrationSource:
     def test_processes_oldest_first_and_advances_the_cursor(self):
         rpc = FakeRpc()
         rpc.signatures = [{"signature": "s3", "slot": 3, "err": None}, {"signature": "s2", "slot": 2, "err": {"x": 1}}, {"signature": "s1", "slot": 1, "err": None}, {"signature": "s0", "slot": 0, "err": None}]
-        rpc.txs = {"s1": tx_with([migrate_ix()]), "s3": tx_with([migrate_ix(mint=key("m2"), pool=key("p2"))])}
+        rpc.txs = {"s1": migrate_tx(), "s3": migrate_tx(mint=key("m2"), pool=key("p2"))}
         batch = self.src(rpc).fetch_migrations("s0", 50)
         assert [e.mint for e in batch.events] == [MINT, key("m2")]  # s2 falló on-chain: se salta pero no frena
         assert batch.next_cursor == "s3" and batch.head_slot == 3
@@ -188,7 +283,7 @@ class TestMigrationSource:
     def test_unavailable_transaction_stops_before_it_without_losing_the_gap(self):
         rpc = FakeRpc()
         rpc.signatures = [{"signature": "s2", "slot": 2, "err": None}, {"signature": "s1", "slot": 1, "err": None}, {"signature": "s0", "slot": 0, "err": None}]
-        rpc.txs = {"s1": tx_with([migrate_ix()]), "s2": None}
+        rpc.txs = {"s1": migrate_tx(), "s2": None}
         batch = self.src(rpc).fetch_migrations("s0", 50)
         assert len(batch.events) == 1 and batch.next_cursor == "s1"  # s2 se reintenta en el próximo ciclo
 
@@ -196,8 +291,25 @@ class TestMigrationSource:
         batch = self.src(FakeRpc()).fetch_migrations("s9", 50)
         assert batch.events == () and batch.next_cursor == "s9"
 
+    def test_time_budget_stops_the_batch_and_keeps_the_cursor_behind_the_unprocessed(self):
+        rpc = FakeRpc()
+        rpc.signatures = [{"signature": f"s{i}", "slot": i, "err": None} for i in (4, 3, 2, 1, 0)]
+        rpc.txs = {f"s{i}": migrate_tx(mint=key(f"m{i}"), pool=key(f"p{i}")) for i in (1, 2, 3, 4)}
+        ticks = iter([0.0, 0.5, 1.5, 9.0, 9.5, 99.0])  # inicio; s1 a 0,5 s; s2 a 1,5 s; s3 se pasa del presupuesto de 5 s
+        src = PumpMigrationSource(rpc, clock=ManualClock(NOW), migration_account=key("migr"), budget_s=5.0, monotonic=lambda: next(ticks))
+        batch = src.fetch_migrations("s0", 50)
+        assert [e.mint for e in batch.events] == [key("m1"), key("m2")]
+        assert batch.next_cursor == "s2"  # s3 y s4 se retoman en el próximo ciclo, sin huecos
+
+    def test_noop_retries_advance_the_cursor_without_producing_events(self):
+        rpc = FakeRpc()
+        rpc.signatures = [{"signature": "s2", "slot": 2, "err": None}, {"signature": "s1", "slot": 1, "err": None}, {"signature": "s0", "slot": 0, "err": None}]
+        rpc.txs = {"s1": tx_with([migrate_ix()]), "s2": migrate_tx(mint=key("m2"), pool=key("p2"))}
+        batch = self.src(rpc).fetch_migrations("s0", 50)
+        assert [e.mint for e in batch.events] == [key("m2")] and batch.next_cursor == "s2"
+
     def event(self):
-        return parse_migrations(tx_with([migrate_ix()]), SIG, NOW)[0]
+        return parse_migrations(migrate_tx(), SIG, NOW)[0]
 
     def test_verify_accepts_matching_pool(self):
         rpc = FakeRpc()
@@ -278,6 +390,74 @@ class TestRpcClient:
         with pytest.raises(PermanentSourceError):
             client.call("getSlot", [])
 
+    def test_retry_after_is_honoured_but_total_wait_is_capped(self):
+        # caso real: el RPC público responde 429 con `Retry-After: 10` a getTokenLargestAccounts
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(429, headers={"Retry-After": "10"})
+
+        client, sleeps = rpc_with(handler, max_retries=3)
+        with pytest.raises(TransientSourceError) as exc:
+            client.call("getTokenLargestAccounts", ["m"])
+        assert sleeps == [10.0] and calls["n"] == 2  # la 2.ª espera de 10 s superaría el tope de 12 s: se corta
+        assert "límite de espera" in str(exc.value)
+
+    def test_no_sleep_after_the_last_attempt(self):
+        client, sleeps = rpc_with(lambda r: httpx.Response(503), max_retries=2)
+        with pytest.raises(TransientSourceError, match="reintentos agotados"):
+            client.call("getSlot", [])
+        assert sleeps == [0.5, 1.0]  # antes se dormía también tras el último intento
+
+    def test_optional_concentration_calls_never_retry_or_sleep(self):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(429, headers={"Retry-After": "10"})
+
+        client, sleeps = rpc_with(handler)
+        for fn, arg in ((client.get_token_largest_accounts, "m"), (client.get_token_supply, "m"), (client.get_multiple_accounts_parsed, ["a"])):
+            with pytest.raises(TransientSourceError):
+                fn(arg)
+        assert calls["n"] == 3 and sleeps == []
+
+    def test_get_transaction_asks_for_version_1_so_v1_transactions_are_accepted(self):
+        seen = []
+
+        def handler(request):
+            seen.append(json.loads(request.content)["params"][1]["maxSupportedTransactionVersion"])
+            return httpx.Response(200, json={"result": {"slot": 1}})
+
+        client, _ = rpc_with(handler)
+        assert client.get_transaction("sig") == {"slot": 1} and seen == [1]
+
+    def test_get_transaction_follows_the_node_hint_for_a_newer_version_and_remembers_it(self):
+        seen = []
+        message = 'Transaction version (2) is not supported by the requesting client. Please try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 2'
+
+        def handler(request):
+            version = json.loads(request.content)["params"][1]["maxSupportedTransactionVersion"]
+            seen.append(version)
+            if version < 2:
+                return httpx.Response(200, json={"error": {"code": -32015, "message": message}})
+            return httpx.Response(200, json={"result": {"slot": 9}})
+
+        client, _ = rpc_with(handler)
+        assert client.get_transaction("a") == {"slot": 9}
+        assert client.get_transaction("b") == {"slot": 9}
+        assert seen == [1, 2, 2]  # la segunda transacción ya sale con la versión aprendida
+
+    def test_unsupported_version_hint_is_not_followed_forever(self):
+        def handler(request):
+            message = 'use "maxSupportedTransactionVersion": 1'  # pide lo mismo que ya se envió
+            return httpx.Response(200, json={"error": {"code": -32015, "message": message}})
+
+        client, _ = rpc_with(handler)
+        with pytest.raises(PermanentSourceError):
+            client.get_transaction("x")
+
 
 # ----------------------------------------------------------------------------- mercado
 def swap_tx(*, t, pre_b, post_b, pre_q, post_q, wallets=(), sig="s", err=None):
@@ -315,6 +495,103 @@ class TestMarket:
     def test_ignores_failed_and_unrelated_transactions(self):
         assert swap_of(swap_tx(t=NOW, pre_b=1, post_b=1, pre_q=1, post_q=1)) is None
         assert swap_of(swap_tx(t=NOW, pre_b=10, post_b=9, pre_q=5, post_q=6, err={"x": 1})) is None
+
+    def test_concentration_failures_back_off_exponentially_and_recover(self, caplog):
+        class Rpc(FakeRpc):
+            ok = False
+
+            def get_token_supply(self, mint):
+                if not self.ok:
+                    raise TransientSourceError("429")
+                return {"amount": "1000"}
+
+            def get_token_largest_accounts(self, mint):
+                return [{"address": "a", "amount": "100"}]
+
+            def get_multiple_accounts_parsed(self, keys):
+                return [{"data": {"parsed": {"info": {"owner": "holder"}}}}]
+
+        rpc = Rpc()
+        source = SolanaMarketSource(rpc, clock=ManualClock(NOW), concentration_refresh_s=60)
+        pool = PoolInfo(POOL, MINT, "T", "Token", 6, PUMPSWAP_PROGRAM_ID, WSOL_MINT, NOW, SIG, 0, 1, True, True, True)
+        st = _PoolState(base_vault=VAULT_B, quote_vault=VAULT_Q)
+        waits = []
+        with caplog.at_level("WARNING", logger="app.infrastructure.solana_market"):
+            now = NOW
+            for _ in range(7):
+                source._refresh_concentration(pool, st, now)
+                waits.append((st.next_conc_at - now).total_seconds())
+                now = st.next_conc_at
+        assert waits == [60, 120, 240, 480, 600, 600, 600]  # duplica y se detiene en el tope de 10 min
+        assert sum("concentración no disponible" in r.message for r in caplog.records) == 1  # un aviso por pool
+        assert st.conc is None  # nunca se inventa un valor
+        rpc.ok = True
+        source._refresh_concentration(pool, st, now)
+        assert st.conc is not None and st.conc_failures == 0
+        assert (st.next_conc_at - now).total_seconds() == 60  # recuperado: vuelve al ritmo normal
+
+    def test_concurrent_reads_are_applied_in_strict_order_and_stall_at_the_first_missing_tx(self):
+        import time as _time
+
+        class Rpc(FakeRpc):
+            def get_transaction(self, sig):
+                _time.sleep({"s1": 0.08, "s2": 0.04, "s3": 0.0, "s4": 0.0, "s5": 0.0}[sig])  # terminan fuera de orden
+                return self.txs.get(sig)
+
+        rpc = Rpc()
+        rpc.accounts[POOL] = {"owner": PUMPSWAP_PROGRAM_ID, "data": [pool_account_b64(), "base64"]}
+        reserves = {"s1": (1000, 1000), "s2": (900, 1100), "s3": (800, 1200), "s4": (700, 1300), "s5": (600, 1400)}
+        rpc.signatures = [{"signature": n, "slot": int(n[1:]), "err": None} for n in ("s5", "s4", "s3", "s2", "s1")]
+        for n, (b, q) in reserves.items():
+            prev = (b + 100, q - 100) if n != "s1" else (0, 0)
+            rpc.txs[n] = swap_tx(t=NOW + timedelta(seconds=int(n[1:])), pre_b=prev[0], post_b=b, pre_q=prev[1], post_q=q, sig=n)
+        rpc.txs["s4"] = None  # todavía no disponible
+        source = SolanaMarketSource(rpc, clock=ManualClock(NOW + timedelta(minutes=5)), concurrency=5)
+        pool = PoolInfo(POOL, MINT, "T", "Token", 6, PUMPSWAP_PROGRAM_ID, WSOL_MINT, NOW, SIG, 0, 1, True, True, True)
+        state = source._state(pool)
+        source._poll(pool, state)
+        assert [s.signature for s in state.swaps] == ["s1", "s2", "s3"]  # en orden, aunque s3 terminó antes que s1
+        assert [e["signature"] for e in state.backlog] == ["s4", "s5"]  # s4 frena: s5 no se aplica antes que s4
+        rpc.txs["s4"] = swap_tx(t=NOW + timedelta(seconds=4), pre_b=800, post_b=700, pre_q=1200, post_q=1300, sig="s4")
+        source._poll(pool, state)
+        assert [s.signature for s in state.swaps] == ["s1", "s2", "s3", "s4", "s5"] and not state.backlog
+
+    def test_poll_time_budget_leaves_the_rest_for_the_next_cycle(self):
+        rpc = FakeRpc()
+        rpc.accounts[POOL] = {"owner": PUMPSWAP_PROGRAM_ID, "data": [pool_account_b64(), "base64"]}
+        names = ["s5", "s4", "s3", "s2", "s1"]  # del más nuevo al más viejo, como el RPC real
+        rpc.signatures = [{"signature": n, "slot": 5 - i, "err": None} for i, n in enumerate(names)]
+        reserves = {"s1": (1000, 1000), "s2": (900, 1100), "s3": (800, 1200), "s4": (700, 1300), "s5": (600, 1400)}
+        for n, (b, q) in reserves.items():
+            prev = (b + 100, q - 100) if n != "s1" else (0, 0)
+            rpc.txs[n] = swap_tx(t=NOW + timedelta(seconds=int(n[1:])), pre_b=prev[0], post_b=b, pre_q=prev[1], post_q=q, sig=n)
+        ticks = iter([0.0, 1.0, 2.0, 99.0, 100.0, 101.0])  # presupuesto de 5 s: se procesan s1 y s2; en s3 ya se pasó
+        source = SolanaMarketSource(rpc, clock=ManualClock(NOW + timedelta(minutes=5)), poll_budget_s=5.0, monotonic=lambda: next(ticks))
+        pool = PoolInfo(POOL, MINT, "T", "Token", 6, PUMPSWAP_PROGRAM_ID, WSOL_MINT, NOW, SIG, 0, 1, True, True, True)
+        state = source._state(pool)
+        source._poll(pool, state)
+        assert [s.signature for s in state.swaps] == ["s1", "s2"]
+        assert [e["signature"] for e in state.backlog] == ["s3", "s4", "s5"]  # el pendiente queda guardado
+        assert state.head_sig == "s5"
+        assert state.complete_until == state.swaps[-1].at  # no se declara completo hasta ver todo lo pendiente
+
+        # el sondeo siguiente no vuelve a listar lo ya visto: pide solo lo posterior a s5 y sigue con el pendiente
+        listed: list[str | None] = []
+        original = rpc.get_signatures_for_address
+
+        def spy(address, *, before=None, until=None, limit=1000):
+            listed.append(until)
+            return original(address, before=before, until=until, limit=limit)
+
+        rpc.get_signatures_for_address = spy  # type: ignore[method-assign]
+        rpc.signatures.insert(0, {"signature": "s6", "slot": 6, "err": None})
+        rpc.txs["s6"] = swap_tx(t=NOW + timedelta(seconds=6), pre_b=700, post_b=600, pre_q=1300, post_q=1400, sig="s6")
+        ticks2 = iter(float(i) for i in range(100))
+        source._mono = lambda: next(ticks2)  # type: ignore[method-assign]
+        source._poll(pool, state)
+        assert listed == ["s5"]
+        assert [s.signature for s in state.swaps] == ["s1", "s2", "s3", "s4", "s5", "s6"] and not state.backlog
+        assert state.complete_until is not None and state.complete_until > state.swaps[-1].at - timedelta(days=1)
 
     def rec(self, t, kind, price, base, quote, vol=0, wallets=None):
         return SwapRecord(at=t, slot=1, signature="s", kind=kind, price=Decimal(price), base_reserve=base, quote_reserve=quote, quote_volume=vol, wallet_deltas=wallets or {})
@@ -427,6 +704,32 @@ class TestJupiter:
         q = JupiterQuoteProvider(client).quote_sell(POOL_INFO, 1, 300, NOW)
         assert q.status is QuoteStatus.NO_ROUTE and not q.ok
 
+    def test_real_no_route_body_from_jupiter_v2_is_no_route_but_an_invalid_mint_is_an_error(self):
+        # cuerpos reales capturados de api.jup.ag/swap/v2/order (HTTP 400)
+        client, _ = jup(lambda r: httpx.Response(400, json={"requestId": "01a21115-d6f6", "error": "Failed to get quotes"}))
+        assert JupiterQuoteProvider(client).quote_sell(POOL_INFO, 1, 300, NOW).status is QuoteStatus.NO_ROUTE
+        invalid = {"error": "inputMint or outputMint is not a valid token mint: 11111111111111111111111111111112"}
+        client, _ = jup(lambda r: httpx.Response(400, json=invalid))
+        q = JupiterQuoteProvider(client).quote_buy(POOL_INFO, 1, 300, NOW)
+        assert q.status is QuoteStatus.ERROR and "valid token mint" in (q.error or "")
+
+    def test_maps_a_real_order_response_without_taker(self):
+        # respuesta real (campos relevantes): sin `taker`, prioridad/firma/renta vienen en 0 y se usan las estimaciones
+        real = {
+            "swapMode": "ExactIn", "inAmount": "100000000", "outAmount": "377741029270002",
+            "otherAmountThreshold": "366408798391901", "priceImpactPct": -0.49293027426579605, "priceImpact": -49.293027426579606,
+            "feeBps": 10, "signatureFeeLamports": 0, "prioritizationFeeLamports": 0, "rentFeeLamports": 0,
+            "router": "dflow", "requestId": "01a21113-7e00", "transaction": "", "taker": None,
+            "routePlan": [{"percent": 100, "swapInfo": {"label": "Pump.fun AMM", "inAmount": "99900000", "outAmount": "377741029270002"}}],
+        }  # fmt: skip
+        client, _ = jup(lambda r: httpx.Response(200, json=real))
+        q = JupiterQuoteProvider(client).quote_buy(POOL_INFO, 100_000_000, 300, NOW)
+        assert q.ok and q.out_amount == 377_741_029_270_002 and q.min_out_amount == 366_408_798_391_901
+        assert q.price_impact_bps == Decimal("4929.3027426579606") and q.route == "Pump.fun AMM"
+        costs = {c.kind: c for c in q.costs}
+        assert costs["protocol"].lamports == 100_000 and costs["protocol"].included_in_amount  # 10 bps de 0,1 SOL
+        assert costs["priority"].lamports == 100_000 and costs["ata_deposit"].lamports == 2_039_280 and "signature" not in costs
+
     def test_empty_out_amount_is_no_route(self):
         client, _ = jup(lambda r: httpx.Response(200, json={**ORDER_BODY, "outAmount": "0"}))
         assert JupiterQuoteProvider(client).quote_sell(POOL_INFO, 1, 300, NOW).status is QuoteStatus.NO_ROUTE
@@ -481,7 +784,26 @@ def test_websocket_notification_filtering():
     assert extract_signature(msg(err={"x": 1})) is None
     assert extract_signature(msg(logs=("Program log: Instruction: Buy",))) is None
     assert extract_signature(msg(logs=())) == "abc"  # logs truncados: se deja pasar y el trabajo verifica
+    retry = ("Program log: Instruction: MigrateV2", "Program log: Bonding curve already migrated")
+    assert extract_signature(msg(logs=retry)) is None  # reintento sin efecto: no vale una consulta de transacción
     assert extract_signature('{"id":1,"result":42}') is None and extract_signature("no json") is None
+
+
+def test_websocket_uses_the_certifi_bundle_under_whichever_parameter_name_the_library_has():
+    import ssl
+
+    from app.infrastructure.solana_ws import tls_kwargs
+
+    def new_api(uri, *, ssl=None, open_timeout=10): ...
+
+    def old_api(uri, *, ssl_context=None, open_timeout=10): ...
+
+    for fn, name in ((new_api, "ssl"), (old_api, "ssl_context")):
+        (key, ctx), = tls_kwargs(fn).items()
+        assert key == name and isinstance(ctx, ssl.SSLContext) and ctx.verify_mode is ssl.CERT_REQUIRED
+        assert ctx.check_hostname  # la verificación sigue activa: solo cambia el bundle de CA
+    # el contexto trae los certificados de certifi y no depende del almacén del sistema
+    assert tls_kwargs(new_api)["ssl"].cert_store_stats()["x509_ca"] > 50
 
 
 def test_log_redaction_hides_keys_and_credentials():

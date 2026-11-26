@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     estimated_priority_fee_lamports: int = 100_000
     estimated_ata_deposit_lamports: int = 2_039_280
     concentration_refresh_s: int = 60
+    # Topes de tiempo real por ciclo en modo live: un RPC lento no debe bloquear el latido ni el seguimiento de
+    # posiciones abiertas. Lo que no alcanza a procesarse sigue en el ciclo siguiente.
+    ingest_budget_s: float = 10.0  # lectura de transacciones de migración
+    poll_budget_s: float = 8.0  # sondeo de transacciones de un pool
+    evaluation_budget_s: float = 20.0  # evaluación de todos los pools del ciclo
+    # Transacciones leídas a la vez por pool. Con el RPC público (≈10 req/s en total) más de 2 no ayuda y agrega 429;
+    # con un proveedor de cupo alto conviene subirlo (8–16) para seguir el ritmo de los pools calientes.
+    rpc_concurrency: int = 2
 
     # --- modo de datos: "fixtures" reproduce escenarios grabados; "live" usa RPC y Jupiter
     data_mode: Literal["fixtures", "live"] = "fixtures"

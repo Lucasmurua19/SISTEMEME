@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE_STRATEGY = "config/strategy-fixtures-v1.json"
+# Reglas congeladas del modo live: un archivo explícito y versionado, no valores implícitos del código.
+DEFAULT_LIVE_STRATEGY = "config/strategy-live-v1.json"
 
 
 def resolve_path(raw: str) -> Path:
@@ -37,11 +39,9 @@ def resolve_path(raw: str) -> Path:
 
 
 def load_strategy(settings: Settings) -> StrategyConfig:
-    """Versión de estrategia: archivo explícito, valores de fixtures o valores por defecto del código."""
-    raw = settings.strategy_config_path or (DEFAULT_FIXTURE_STRATEGY if settings.data_mode == "fixtures" else None)
-    if raw:
-        return StrategyConfig.from_dict(json.loads(resolve_path(raw).read_text(encoding="utf-8")))
-    return StrategyConfig().validate()
+    """Versión de estrategia: el archivo indicado o, por defecto, el archivo congelado del modo de datos."""
+    raw = settings.strategy_config_path or (DEFAULT_FIXTURE_STRATEGY if settings.data_mode == "fixtures" else DEFAULT_LIVE_STRATEGY)
+    return StrategyConfig.from_dict(json.loads(resolve_path(raw).read_text(encoding="utf-8")))
 
 
 def align(ts: datetime, step_s: int) -> datetime:
@@ -112,5 +112,6 @@ def build_worker(settings: Settings) -> tuple[Worker, dict[str, Any]]:
         source_max_age_s=settings.source_max_age_s,
         source_max_failures=settings.source_max_failures,
         job_claim_ttl_s=settings.job_claim_ttl_s,
+        evaluation_budget_s=settings.evaluation_budget_s if settings.data_mode == "live" else None,
     )
     return worker, extras

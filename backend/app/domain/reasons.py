@@ -22,6 +22,7 @@ class ReasonCode(StrEnum):
     # Identidad y migración
     MIGRATION_UNVERIFIED = "MIGRATION_UNVERIFIED"
     IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    UNSUPPORTED_QUOTE_MINT = "UNSUPPORTED_QUOTE_MINT"  # migración real cotizada en otro token (no SOL): fuera de alcance
     # Datos
     NO_MARKET_DATA = "NO_MARKET_DATA"
     STALE_MARKET_DATA = "STALE_MARKET_DATA"

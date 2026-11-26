@@ -22,7 +22,11 @@ from app.domain.models import USDC_MINT, WSOL_MINT, PoolInfo, Quote, QuoteCost, 
 
 log = logging.getLogger(__name__)
 
-_NO_ROUTE_MARKERS = ("could_not_find_any_route", "no route", "no routes", "route not found", "token_not_tradable")
+# «failed to get quotes» es lo que responde hoy Jupiter v2 (HTTP 400) cuando no hay ruta para un mint válido,
+# comprobado contra la API real. Un mint inválido responde otro texto y sigue siendo un error.
+_NO_ROUTE_MARKERS = (
+    "could_not_find_any_route", "no route", "no routes", "route not found", "token_not_tradable", "failed to get quotes",
+)  # fmt: skip
 
 
 class JupiterClient:

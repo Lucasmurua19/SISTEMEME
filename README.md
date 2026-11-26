@@ -59,9 +59,15 @@ cd ..\frontend; npm run typecheck
 | `DATA_MODE` | Fuente | Para qué |
 |---|---|---|
 | `fixtures` (por defecto) | Escenarios JSON deterministas de `backend/fixtures/scenarios`, reloj de reproducción persistido | Desarrollo, demos y pruebas reproducibles |
-| `live` | Solana RPC + WebSocket, PumpSwap y Jupiter Swap v2 (`GET /order`, solo cotización) | Observación real. Requiere `SOLANA_RPC_URL` y, para más cupo, `JUPITER_API_KEY` |
+| `live` | Solana RPC + WebSocket, PumpSwap y Jupiter Swap v2 (`GET /order`, solo cotización) | Observación real, solo lectura (no hay claves ni firma de transacciones). Requiere `SOLANA_RPC_URL`; `JUPITER_API_KEY` es opcional (más cupo) |
 
 Antes de evaluar señales en vivo, mirá el indicador de estado del panel: una fuente degradada (sin lecturas sanas o con fallas seguidas) **bloquea nuevas entradas** pero mantiene el seguimiento de posiciones abiertas.
+
+**Reglas del modo live.** Por defecto usa `backend/config/strategy-live-v1.json`: los valores por defecto del código, fijados *antes* de ver resultados reales y **sin calibrar con datos**. La versión se guarda con su huella; cambiar un umbral exige un archivo con otro nombre (`STRATEGY_CONFIG_PATH`), nunca editar ese. Así las sesiones de ranking y de liquidez se comparan bajo las mismas reglas congeladas.
+
+**Qué RPC usar.** El RPC público de Solana (`api.mainnet-beta.solana.com`) sirve para una prueba de humo y el worker lo avisa en el log. Limita la tasa (HTTP 429 con `Retry-After`; `getTokenLargestAccounts` en particular) y no sostiene varios pools calientes a la vez. Para observar de forma continua usá un proveedor con cupo propio: sin él, la concentración de holders queda desconocida (el filtro queda pendiente, nunca se inventa) y la lectura de swaps va por detrás de los pools más activos. Si `SOLANA_RPC_URL` conserva el valor de ejemplo de `.env.example`, el worker no arranca y lo dice.
+
+**El ciclo del worker está acotado en tiempo** (`INGEST_BUDGET_S`, `POLL_BUDGET_S`, `EVALUATION_BUDGET_S`): con un RPC lento, lo que no alcanza se retoma en el ciclo siguiente en vez de bloquear el latido, los trabajos y el seguimiento de posiciones abiertas. El log registra el tiempo de cada paso y avisa cuando uno es lento.
 
 ## Cómo decide el sistema
 
@@ -70,7 +76,9 @@ Antes de evaluar señales en vivo, mirá el indicador de estado del panel: una f
 3. **Filtros obligatorios** (cada uno deja motivo, valor y umbral): migración verificada, identidad mint–pool, edad, datos frescos, concentración evaluable y aceptable, patrón confirmado, compradores netos, profundidad, estabilidad de liquidez, ruta de compra y venta, cotización vigente y costo de ida y vuelta.
 4. **Puntaje** 0–100 sin redondear: recuperación 40 % · liquidez 30 % · costo 20 % · holders 10 %, con rangos fijos por versión (no depende de otros candidatos). Desempate por costo y por frescura de la cotización.
 5. **Simulación.** Reserva de capital al admitir la señal → entrada con cotización nueva tras el retraso (rechazo registrado si cambió precio, ruta o costo) → valoración conservadora → salida por invalidación, deterioro de liquidez, objetivo o tiempo máximo. Una venta fallida **deja la posición abierta**, registra la causa y reintenta con más tolerancia de slippage; una posición sin ruta se muestra aparte con escenario de recuperación cero.
-6. **Evaluación.** Dos sesiones con el mismo universo, presupuesto, retrasos y reglas: *ranking por puntaje* contra *referencia por liquidez*. PnL neto en SOL y USD, expectativa, tasa de acierto, caída máxima, PnL sin la mejor operación, escenario adverso, posiciones con salida fallida y bloque cronológico (`since`/`until`).
+6. **Evaluación.** Dos sesiones con el mismo universo, presupuesto, retrasos y reglas: *ranking por puntaje* contra *referencia por liquidez*. PnL neto en SOL y USD, expectativa, tasa de acierto, caída máxima del PnL realizado, PnL sin la mejor operación, escenario adverso, posiciones con salida fallida y bloque cronológico (`since`/`until`).
+
+   **Cómo leer el resultado de una sesión.** El panel muestra tres cifras con el mismo peso: *PnL realizado* (solo ventas ya ejecutadas), *Abiertas valoradas* y *Total valorado* (la suma). Las abiertas se valoran de forma conservadora: las que tienen ruta de salida, vendidas al mínimo garantizado y después de costos; las que no tienen ruta, a recuperación cero (pérdida del monto entero). Debajo se informa también la cota optimista (a precio cotizado) y la hora de la valoración más vieja. La *caída máxima del PnL realizado* se calcula solo con operaciones cerradas, por eso no incluye la pérdida latente de las abiertas; para ver ese riesgo mirá *Abiertas valoradas*. (Los documentos de especificación la llaman «caída máxima del capital»: el nombre se cambió a propósito para que no sugiera algo que el cálculo no hace.)
 
 Estados de candidato: `observing`, `pending_data`, `eligible`, `rejected`, `expired`. Los códigos de motivo (`NO_SELL_ROUTE`, `STALE_MARKET_DATA`, `SESSION_LIMIT`, …) son estables y están en [reasons.py](backend/app/domain/reasons.py).
 
@@ -131,13 +139,23 @@ compose.yaml  .env.example
 ## Verificación realizada y límites conocidos
 
 **Verificado en este entorno**
-- 146 pruebas automáticas: reglas de dominio, flujo completo con fixtures (migración → señal → posición → PnL), API, migraciones (`upgrade`, `check` sin diferencias y `downgrade`) y **PostgreSQL real** (tipos `NUMERIC(40,0)`/`JSONB`, enteros u64 exactos, cuatro workers compitiendo por las mismas señales, reclamos con `SKIP LOCKED`).
+- 187 pruebas automáticas: reglas de dominio, flujo completo con fixtures (migración → señal → posición → PnL), API, migraciones (`upgrade`, `check` sin diferencias y `downgrade`), **PostgreSQL real** (tipos `NUMERIC(40,0)`/`JSONB`, enteros u64 exactos, cuatro workers compitiendo por las mismas señales, reclamos con `SKIP LOCKED`) y **transacciones reales de mainnet** capturadas como fixtures (`backend/tests/fixtures/solana_real/`).
 - Frontend: chequeo de tipos, build de producción y revisión visual con capturas (tema oscuro, claro y 500 px de ancho).
 - **`docker compose up --build` en Windows con Docker 26:** las imágenes se construyen, `migrate` aplica Alembic sobre PostgreSQL 16, y `db`, `api` y `web` quedan `healthy`. La reproducción de fixtures sobre ese PostgreSQL dio el mismo resultado exacto que las pruebas con SQLite.
+- **Modo `live` en solo lectura contra Solana y Jupiter reales** (2026-11-25, RPC público de Solana y Jupiter sin clave, base SQLite descartable). Se siguió una migración real de punta a punta con los adaptadores del sistema: firma → evento de migración → verificación on-chain del pool (cuenta real en PumpSwap, PDA canónica) → snapshots de mercado por ventanas → cotización de compra y de salida en Jupiter. Durante unos 12 minutos el worker detectó 13 migraciones reales por WebSocket y por reconciliación, y registró una evaluación real. Esa prueba encontró y corrigió defectos que las respuestas sintéticas no mostraban:
+  - Las transacciones versión 1 se rechazaban (`maxSupportedTransactionVersion`).
+  - Casi la mitad del tráfico de la cuenta de migración son reintentos de bots sobre una curva ya migrada («Bonding curve already migrated»); el `migrate` viejo los tomaba por migraciones nuevas. Ahora una migración exige el `create_pool` real de PumpSwap.
+  - Jupiter responde `HTTP 400 «Failed to get quotes»` cuando no hay ruta; se clasificaba como error de la fuente en lugar de «sin ruta».
+  - El WebSocket no verificaba el certificado en Windows; usa ahora el mismo bundle que `httpx`.
+  - Un ciclo del worker se bloqueaba 55–96 s esperando al RPC (sin latido ni seguimiento de posiciones): ahora hay topes de tiempo, latido entre pools, concentración sin reintentos y con retroceso, y lectura concurrente.
+  - Hay migraciones legítimas cuyo pool cotiza en **otro token de Pump.fun** y no en SOL (1 de 13); se rechazan con su propio motivo, `UNSUPPORTED_QUOTE_MINT`, sin gastar cotizaciones.
 
 **No verificado (decílo antes de confiar en ello)**
-- **El modo `live` contra Solana y Jupiter reales.** Los adaptadores se probaron con respuestas sintéticas y transportes HTTP simulados, siguiendo el IDL público de Pump.fun/PumpSwap y la documentación de Jupiter. Hacé una prueba de humo con tu RPC antes de usarlo. Puntos a confirmar: la cuenta de migración por defecto (`PUMP_MIGRATION_ACCOUNT`, con la que se consulta en vez de todo el programa); el mapa de cuentas de `migrate_v2`, que se deduce del `create_pool` interno y, si no coincide, **falla cerrado** (el pool queda sin verificar y no se evalúa); y los campos de respuesta de `/order`. La verificación de identidad usa la cuenta real del pool, no solo la derivación de PDA.
-- Rendimiento con tráfico real (muchos pools simultáneos): la lectura de swaps hace una llamada RPC por transacción nueva, con tope por ciclo.
+- **Operación sostenida en vivo.** La prueba duró minutos con el RPC público, que limita la tasa: no se vio cómo se comporta durante horas o días ni con un proveedor de cupo propio.
+- **Ninguna migración real llegó a señal ni a posición simulada.** No es una conclusión sobre la estrategia: con el RPC público la concentración de holders queda desconocida (el filtro queda pendiente), el sondeo de swaps no alcanzó a los pools calientes y las reservas iniciales observadas fueron muy dispares (0,14 SOL, 0,29 SOL y 70,9 SOL en las tres que se midieron, contra los 20 SOL que exige el filtro de profundidad). Por eso la cotización de salida se verificó con los adaptadores sobre un pool real, pero **no a través de una evaluación completa del worker**.
+- Latencia de ingesta: entre el bloque y el registro pasaron entre 1,6 y 30 s (mediana ≈ 11 s). Los trabajos disparados por WebSocket esperan al paso de evaluación del ciclo; un RPC con más cupo la reduce.
+- Los umbrales de `live-v1` no están calibrados y los resultados de fixtures son sintéticos: ninguno es evidencia de rentabilidad.
+- **Comparar Ranking y Liquidez durante varias sesiones todavía no es posible:** hay un único par de sesiones por versión de estrategia, y una sesión que alcanza su pérdida máxima queda pausada para siempre. Hace falta agregar «corridas» de sesión (par de sesiones nuevo por período, con las mismas reglas).
 
 ## Decisiones que complementan los documentos
 

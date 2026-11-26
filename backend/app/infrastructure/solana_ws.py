@@ -7,14 +7,30 @@ La URL del socket puede incluir una clave: no se registra.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import ssl
 import threading
 from collections.abc import Callable
+from typing import Any
 
+import certifi
 from websockets.sync.client import connect
 
 log = logging.getLogger(__name__)
+
+
+def tls_kwargs(connect_fn: Callable[..., Any] = connect) -> dict[str, Any]:
+    """Contexto TLS con el bundle de ``certifi``, el mismo que usa httpx para el RPC y Jupiter.
+
+    Por defecto ``websockets`` valida con el almacén de certificados del sistema operativo. En Windows ese almacén
+    puede no tener el intermedio que el servidor no envía, y la conexión falla con CERTIFICATE_VERIFY_FAILED aunque el
+    RPC por HTTPS funcione (comprobado contra el RPC público de Solana). El nombre del parámetro cambió entre versiones.
+    """
+    params = inspect.signature(connect_fn).parameters
+    name = "ssl" if "ssl" in params else "ssl_context"
+    return {name: ssl.create_default_context(cafile=certifi.where())}
 
 
 def extract_signature(message: str) -> str | None:
@@ -30,6 +46,10 @@ def extract_signature(message: str) -> str | None:
         return None
     logs = value.get("logs") or []
     if logs and not any("Migrate" in line for line in logs):  # si los logs vienen truncados se deja pasar
+        return None
+    # Reintentos de bots sobre una curva ya migrada terminan con éxito pero no crean pool (casi la mitad del tráfico
+    # real de la cuenta): no valen una consulta de transacción.
+    if any("already migrated" in line for line in logs):
         return None
     return str(value["signature"])
 
@@ -57,7 +77,7 @@ class MigrationLogListener(threading.Thread):
         backoff = 1.0
         while not self._stop_event.is_set():
             try:
-                with connect(self._url, open_timeout=10, max_size=2**22) as ws:
+                with connect(self._url, open_timeout=10, max_size=2**22, **tls_kwargs()) as ws:
                     ws.send(
                         json.dumps(
                             {
