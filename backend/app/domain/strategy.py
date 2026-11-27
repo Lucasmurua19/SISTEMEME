@@ -296,6 +296,9 @@ _TERMINAL_REJECT = {
     ReasonCode.DRAWDOWN_TOO_DEEP,
 }
 _EXPIRED = {ReasonCode.PATTERN_EXPIRED, ReasonCode.PATTERN_INVALIDATED}
+# Motivos definitivos: ningún dato posterior puede volver elegible al pool (identidad y cotización son fijas; el patrón
+# no sale de «caída excesiva» ni de «invalidado»; la edad solo crece).
+TERMINAL_CODES: frozenset[ReasonCode] = frozenset(_TERMINAL_REJECT | _EXPIRED)
 
 
 def resolve_status(failing: Iterable[FilterResult]) -> CandidateStatus:

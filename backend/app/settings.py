@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # Transacciones leídas a la vez por pool. Con el RPC público (≈10 req/s en total) más de 2 no ayuda y agrega 429;
     # con un proveedor de cupo alto conviene subirlo (8–16) para seguir el ritmo de los pools calientes.
     rpc_concurrency: int = 2
+    # Tope de solicitudes por segundo al RPC (0 = sin tope). Conviene ponerlo un poco por debajo del límite del plan.
+    rpc_max_rps: float = 0.0
+    # Lectura en bloque con getTransactionsForAddress (extensión de Helius). Si el proveedor no la tiene, se detecta
+    # en la primera consulta y se lee de a una transacción.
+    rpc_bulk_history: bool = True
 
     # --- modo de datos: "fixtures" reproduce escenarios grabados; "live" usa RPC y Jupiter
     data_mode: Literal["fixtures", "live"] = "fixtures"

@@ -19,7 +19,7 @@ from app.application.ports import (
 )
 from app.domain.config import StrategyConfig
 from app.domain.models import PoolInfo, Quote, QuoteStatus
-from app.domain.reasons import CandidateStatus
+from app.domain.reasons import CandidateStatus, PositionStatus
 from app.domain.strategy import EvaluationInput, EvaluationResult, evaluate
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ def evaluate_pools(
     cfg: StrategyConfig,
     budget_s: float | None = None,
     progress: Callable[[], None] | None = None,
+    skip_terminal: bool = False,
     monotonic: Callable[[], float] = time.monotonic,
     shuffle: Callable[[list[PoolInfo]], None] = random.shuffle,
 ) -> list[EvaluationOutcome]:
@@ -56,11 +57,19 @@ def evaluate_pools(
     y el seguimiento de posiciones abiertas. Como el orden fijo dejaría sin atender a los últimos pools, con
     presupuesto se mezcla el orden en cada ciclo. Sin presupuesto (fixtures) el recorrido es completo y determinista.
     ``progress`` se invoca después de cada pool (el worker lo usa para el latido).
+    Con ``skip_terminal`` (modo live) no se vuelven a consultar los pools descartados en forma definitiva, para no
+    gastar cupo del proveedor en algo que ya no puede volverse elegible. Los que tienen posiciones pendientes o
+    abiertas se siguen consultando siempre: su seguimiento depende de estos datos.
     """
     now = clock.now()
     grace = cfg.window_seconds * 2
     with uow_factory() as uow:
         pools = uow.chain.list_active_pools(now, cfg.max_age_after_migration_s + grace)
+        if skip_terminal:
+            terminal = uow.evaluations.terminal_pools(version_id, [p.address for p in pools])
+            if terminal:
+                watched = {x.pool for x in uow.positions.list([PositionStatus.PENDING_ENTRY, PositionStatus.OPEN])}
+                pools = [p for p in pools if p.address not in terminal or p.address in watched]
     deadline = None if budget_s is None else monotonic() + budget_s
     if budget_s is not None:
         shuffle(pools)

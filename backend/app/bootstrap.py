@@ -113,5 +113,6 @@ def build_worker(settings: Settings) -> tuple[Worker, dict[str, Any]]:
         source_max_failures=settings.source_max_failures,
         job_claim_ttl_s=settings.job_claim_ttl_s,
         evaluation_budget_s=settings.evaluation_budget_s if settings.data_mode == "live" else None,
+        skip_terminal_pools=settings.data_mode == "live",
     )
     return worker, extras

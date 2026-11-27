@@ -17,6 +17,9 @@ build/
 *.db
 *.sqlite3
 
+# informes de mediciones locales (scripts/medir_live.py)
+reportes/
+
 # Node / Next.js
 node_modules/
 .next/

@@ -7,14 +7,15 @@ Invariantes:
   intento no duplica capital.
 - Las llamadas de red (cotizaciones, FX) se hacen fuera de las transacciones y la vigencia se
   revalida al escribir.
-- Una venta fallida deja la posición abierta y programa un reintento según la política.
+- Una venta fallida deja la posición abierta, actualiza su valoración y habilita un reintento tras una espera
+  creciente. Cada intento se compara con la cotización tomada al programarlo, nunca con la de un intento anterior.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -38,7 +39,14 @@ from app.domain.reasons import (
     ReasonCode,
 )
 from app.domain.risk import RiskLimits, check_entry
-from app.domain.simulation import ExitSignal, check_exit_trigger, decide_entry, decide_exit_fill
+from app.domain.simulation import (
+    ExitSignal,
+    check_exit_trigger,
+    decide_entry,
+    decide_exit_fill,
+    exit_retry_delay_s,
+    exit_slippage_bps,
+)
 from app.domain.strategy import RankItem, liquidity_order, ranking_order
 
 log = logging.getLogger(__name__)
@@ -317,9 +325,12 @@ def monitor_positions(
     clock: Clock,
     cfg_loader: ConfigLoader,
 ) -> list[MonitorOutcome]:
-    """Valora cada posición abierta con una cotización de salida y dispara intentos de salida.
+    """Valora cada posición abierta con una cotización de salida y programa los intentos de salida.
 
-    Se ejecuta aunque la sesión esté pausada o haya llegado a sus límites: el seguimiento no se corta.
+    Se ejecuta aunque la sesión esté pausada o haya llegado a sus límites: el seguimiento no se corta, y de esta
+    valoración depende el límite de pérdida. Una vez disparada la salida, el disparo no cambia; cada reintento es un
+    intento nuevo cuya referencia es la cotización de este momento. Mientras espera, la posición se revalora como
+    mucho cada ``exit_retry_interval_s`` para no gastar el cupo de cotizaciones.
     """
     now = clock.now()
     with uow_factory() as uow:
@@ -328,14 +339,20 @@ def monitor_positions(
 
     for pos in opened:
         with uow_factory() as uow:
-            if uow.attempts.pending(pos.id, AttemptKind.EXIT.value):
-                continue  # ya hay una salida en curso
             session = uow.sessions.get(pos.session_id)
             pool = uow.chain.get_pool(pos.pool)
             assert session is not None and pool is not None
             snaps = uow.snapshots.list_for_pool(pool.address, now)
             latest = snaps[-1] if snaps else None
         cfg = cfg_loader(session.strategy_version_id)
+        if (
+            pos.exit_trigger
+            and pos.next_exit_at is not None
+            and now < pos.next_exit_at
+            and pos.last_valued_at is not None
+            and (now - pos.last_valued_at).total_seconds() < cfg.exit_retry_interval_s
+        ):
+            continue
 
         sell = _safe_sell(quotes, pool, pos.tokens_expected, cfg.exit_slippage_bps, now)  # red
         valued_at = clock.now()
@@ -353,10 +370,12 @@ def monitor_positions(
 
         with uow_factory() as uow:
             p = uow.positions.get(pos.id, lock=True)
-            if p is None or p.status != PositionStatus.OPEN.value or uow.attempts.pending(p.id, AttemptKind.EXIT.value):
+            if p is None or p.status != PositionStatus.OPEN.value:
                 continue
-            if trigger is None and p.exit_trigger:  # disparador ya fijado y sin intento pendiente: se retoma
-                trigger = ExitSignal(ReasonCode(p.exit_trigger), "disparador previo sin intento pendiente")
+            if p.exit_trigger:  # la salida ya está decidida: se conserva el disparo que la inició
+                trigger = ExitSignal(ReasonCode(p.exit_trigger), "reintento de una salida ya disparada")
+            waiting = p.exit_trigger is not None and p.next_exit_at is not None and valued_at < p.next_exit_at
+            busy = bool(uow.attempts.pending(p.id, AttemptKind.EXIT.value))
             if not sell.ok:
                 uow.quotes.save(sell, pool=pool.address, purpose="valuation")  # evidencia de fallas de cotización
 
@@ -368,7 +387,7 @@ def monitor_positions(
                 "illiquid": (not sell.ok) or p.exit_failures >= cfg.exit_retry_max,
             }
             attempt_id = None
-            if trigger is not None:
+            if trigger is not None and not busy and not waiting:
                 number = uow.attempts.last_number(p.id, AttemptKind.EXIT.value) + 1
                 scheduled = valued_at + timedelta(seconds=cfg.exit_delay_s)
                 attempt_id = uow.attempts.create(
@@ -387,7 +406,8 @@ def monitor_positions(
                         type="exit_attempt", payload={"attempt_id": attempt_id},
                         key=f"exit_attempt:{attempt_id}", run_at=scheduled, now=valued_at,
                     )  # fmt: skip
-                    uow.audit.log("paper_position", str(p.id), "exit_triggered", PositionStatus.OPEN.value,
+                    action = "exit_retried" if p.exit_trigger else "exit_triggered"
+                    uow.audit.log("paper_position", str(p.id), action, PositionStatus.OPEN.value,
                                   PositionStatus.OPEN.value, {"trigger": trigger.code.value, "detail": trigger.detail}, valued_at)  # fmt: skip
             uow.positions.update(p.id, valued_at, **fields)
         outcomes.append(
@@ -405,7 +425,7 @@ def execute_exit(
     cfg_loader: ConfigLoader,
     attempt_id: int,
 ) -> str:
-    """Intenta vender con una cotización nueva. Si falla, la posición sigue abierta y se reintenta."""
+    """Intenta vender con una cotización nueva. Si falla, la posición sigue abierta y el monitoreo la reintenta."""
     now = clock.now()
     with uow_factory() as uow:
         att = uow.attempts.get(attempt_id)
@@ -420,8 +440,6 @@ def execute_exit(
         pool = uow.chain.get_pool(pos.pool)
         assert session is not None and pool is not None
     cfg = cfg_loader(session.strategy_version_id)
-
-    from app.domain.simulation import exit_slippage_bps
 
     quote = _safe_sell(quotes, pool, pos.tokens_expected, exit_slippage_bps(cfg, att.number), now)  # red
     fx_rate = _safe_fx(fx, now)  # red
@@ -477,9 +495,15 @@ def execute_exit(
                           {"trigger": att.trigger, "pnl_lamports": str(proceeds - position.debited_lamports)}, decided_at)  # fmt: skip
             return "closed"
 
-        # Venta fallida: la posición sigue abierta, se registra el fallo y se programa el reintento.
+        # Venta fallida: la posición sigue abierta, se registra el fallo y se revalora con la cotización recién vista.
         failures = position.exit_failures + 1
-        retry_at = decided_at + timedelta(seconds=cfg.exit_retry_interval_s)
+        retry_at = decided_at + timedelta(seconds=exit_retry_delay_s(cfg, failures))
+        recoverable = adverse = 0
+        if quote.ok:
+            # el escenario adverso usa la tolerancia base, como en el monitoreo, no la ampliada del reintento
+            floor = quote.out_amount * (10_000 - cfg.exit_slippage_bps) // 10_000
+            recoverable = net_exit_proceeds(quote) + position.immobilized_lamports
+            adverse = adverse_exit_proceeds(replace(quote, min_out_amount=floor)) + position.immobilized_lamports
         uow.attempts.finish(
             att.id,
             status=AttemptStatus.FAILED,
@@ -489,27 +513,16 @@ def execute_exit(
             failure_cause=decision.cause.value if decision.cause else None,
             detail={"slippage_bps": decision.slippage_bps, "message": decision.message},
         )
-        next_id = uow.attempts.create(
-            position_id=position.id,
-            kind=AttemptKind.EXIT.value,
-            number=att.number + 1,
-            scheduled_at=retry_at,
-            trigger=att.trigger,
-            reference_out_lamports=att.reference_out_lamports,
-            detail={"retry_of": att.id},
-        )
-        if next_id is not None:
-            uow.jobs.enqueue(
-                type="exit_attempt", payload={"attempt_id": next_id},
-                key=f"exit_attempt:{next_id}", run_at=retry_at, now=decided_at,
-            )  # fmt: skip
         uow.positions.update(
             position.id,
             decided_at,
             exit_failures=failures,
             illiquid=failures >= cfg.exit_retry_max or not quote.ok,
             next_exit_at=retry_at,
-            **({"last_recoverable_lamports": 0, "last_recoverable_adverse_lamports": 0} if not quote.ok else {}),
+            last_recoverable_lamports=recoverable,
+            last_recoverable_adverse_lamports=adverse,
+            last_valued_at=decided_at,
+            valuation_status="ok" if quote.ok else quote.status.value,
         )
         uow.audit.log("paper_position", str(position.id), "exit_failed", PositionStatus.OPEN.value,
                       PositionStatus.OPEN.value,

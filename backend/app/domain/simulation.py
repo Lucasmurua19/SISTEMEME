@@ -18,6 +18,7 @@ from .models import MarketSnapshot, PositionInfo, Quote, QuoteStatus, RoundTrip,
 from .reasons import ReasonCode
 
 BPS = Decimal(10_000)
+MAX_EXIT_RETRY_INTERVAL_S = 120  # no es parte de la configuración versionada para no alterar la huella de las versiones
 
 
 # --------------------------------------------------------------------------- entrada
@@ -155,6 +156,12 @@ def exit_slippage_bps(cfg: StrategyConfig, attempt_number: int) -> int:
     return min(cfg.max_exit_slippage_bps, cfg.exit_slippage_bps + cfg.exit_slippage_step_bps * max(0, attempt_number - 1))
 
 
+def exit_retry_delay_s(cfg: StrategyConfig, failures: int) -> int:
+    """Espera antes del próximo intento: arranca en ``exit_retry_interval_s`` y se duplica en cada fallo, con tope."""
+    cap = max(cfg.exit_retry_interval_s, MAX_EXIT_RETRY_INTERVAL_S)
+    return min(cap, cfg.exit_retry_interval_s * 2 ** min(max(0, failures - 1), 16))
+
+
 def decide_exit_fill(
     *,
     quote: Quote | None,
@@ -164,6 +171,9 @@ def decide_exit_fill(
     cfg: StrategyConfig,
 ) -> ExitDecision:
     """Decide si un intento de salida se ejecuta con la cotización posterior al retraso.
+
+    ``reference_out_lamports`` es la cotización tomada al programar **este** intento: la tolerancia protege el tramo
+    entre programar y ejecutar, no la distancia al precio que disparó la salida.
 
     Una venta fallida deja la posición abierta: el llamador registra el fallo y reintenta según la
     política (la tolerancia de slippage crece en cada reintento hasta un tope).
@@ -183,7 +193,7 @@ def decide_exit_fill(
             return ExitDecision(
                 False,
                 ReasonCode.SLIPPAGE_EXCEEDED,
-                "la salida cayó más que la tolerancia respecto de la referencia del disparo",
+                "la salida cayó más que la tolerancia respecto de la cotización con que se programó el intento",
                 slippage_bps=tolerance,
             )
     return ExitDecision(

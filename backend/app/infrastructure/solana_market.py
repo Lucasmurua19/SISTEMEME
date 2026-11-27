@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from bisect import bisect_left
 from collections import defaultdict, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -18,13 +19,14 @@ from decimal import Decimal
 from itertools import islice
 from typing import Any
 
-from app.application.ports import Clock
+from app.application.ports import Clock, PermanentSourceError
 from app.domain.models import HUNDRED, LAMPORTS_PER_SOL, MarketSnapshot, PoolInfo
-from app.infrastructure.solana_rpc import SolanaRpcClient, parse_pool_account
+from app.infrastructure.solana_rpc import SolanaRpcClient, parse_pool_account, reserves_after_swap
 
 log = logging.getLogger(__name__)
 
 CONC_BACKOFF_MAX_S = 600
+BULK_STATS_EVERY_S = 300
 BURN_ADDRESSES = frozenset({"1nc1nerator11111111111111111111111111111111", "11111111111111111111111111111111"})
 
 
@@ -34,11 +36,12 @@ class SwapRecord:
     slot: int
     signature: str
     kind: str  # init | buy | sell | liquidity
-    price: Decimal | None
+    price: Decimal | None  # sobre la reserva efectiva de SOL (bóveda + virtual)
     base_reserve: int
-    quote_reserve: int
+    quote_reserve: int  # SOL real en la bóveda: base de los filtros de profundidad y retención
     quote_volume: int
     wallet_deltas: dict[str, int] = field(default_factory=dict)
+    virtual_quote_reserves: int = 0  # vigente tras esta transacción; la usa la siguiente que no informe la suya
 
 
 def _keys(tx: dict[str, Any]) -> list[str]:
@@ -55,9 +58,20 @@ def _amount_at(entries: list[dict[str, Any]], keys: list[str], address: str) -> 
 
 
 def extract_swap(
-    tx: dict[str, Any], *, pool_address: str, mint: str, base_vault: str, quote_vault: str, decimals: int
+    tx: dict[str, Any],
+    *,
+    pool_address: str,
+    mint: str,
+    base_vault: str,
+    quote_vault: str,
+    decimals: int,
+    virtual_quote_reserves: int = 0,
 ) -> SwapRecord | None:
-    """Clasifica una transacción que toca las bóvedas del pool. ``None`` si no mueve las reservas."""
+    """Clasifica una transacción que toca las bóvedas del pool. ``None`` si no mueve las reservas.
+
+    El precio usa la reserva efectiva de SOL. Un swap la informa en su evento; el resto de las transacciones
+    (creación, aportes de liquidez) usan ``virtual_quote_reserves``, la última conocida del pool.
+    """
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
         return None
@@ -83,8 +97,17 @@ def extract_swap(
     else:
         return None
 
+    after = reserves_after_swap(tx, pool_address)
+    if after is None:
+        base, effective_quote = post_b, post_q + virtual_quote_reserves
+    else:
+        base, effective_quote = after.base, after.quote
+        if after.base == post_b:  # nada movió el pool después del swap: la diferencia con la bóveda es la virtual
+            virtual_quote_reserves = after.quote - post_q
     price = (
-        (Decimal(post_q) / LAMPORTS_PER_SOL) / (Decimal(post_b) / Decimal(10**decimals)) if post_b > 0 else None
+        (Decimal(effective_quote) / LAMPORTS_PER_SOL) / (Decimal(base) / Decimal(10**decimals))
+        if base > 0 and effective_quote > 0
+        else None
     )
     pre_w: dict[str, int] = defaultdict(int)
     post_w: dict[str, int] = defaultdict(int)
@@ -105,6 +128,7 @@ def extract_swap(
         quote_reserve=post_q,
         quote_volume=abs(dq),
         wallet_deltas={o: d for o, d in deltas.items() if d != 0},
+        virtual_quote_reserves=virtual_quote_reserves,
     )
 
 
@@ -145,11 +169,18 @@ def compute_concentration(
 class _PoolState:
     base_vault: str
     quote_vault: str
+    virtual: int = 0  # reserva virtual de SOL: la de la cuenta al empezar y luego la que informe cada swap
     swaps: list[SwapRecord] = field(default_factory=list)
     unparsed_at: list[datetime] = field(default_factory=list)
     head_sig: str | None = None  # firma más nueva ya listada
     backlog: deque[dict[str, Any]] = field(default_factory=deque)  # listadas y sin procesar, de la más antigua a la más nueva
     complete_until: datetime | None = None
+    truncated: bool = False  # el historial no se pudo leer entero: no se arman ventanas
+    cursor: str | None = None  # lectura en bloque: última transacción leída
+    read_count: int = 0  # lectura en bloque: transacciones leídas de este pool
+    caught_up: bool = False  # lectura en bloque: la última consulta llegó hasta el presente
+    late_warned: bool = False
+    used_at: datetime | None = None
     conc: Decimal | None = None
     conc_at: datetime | None = None
     next_conc_at: datetime | None = None
@@ -171,7 +202,14 @@ class SolanaMarketSource:
         concentration_refresh_s: int = 60,
         poll_budget_s: float | None = None,
         concurrency: int = 1,
+        max_signature_pages: int = 30,  # 30.000 firmas: más de 15 minutos de un pool muy activo
         monotonic: Callable[[], float] = time.monotonic,
+        bulk: bool = False,
+        bulk_page: int = 500,  # unos 10 MB por respuesta
+        bulk_max_per_poll: int = 2000,
+        bulk_max_per_pool: int = 60_000,  # tope de gasto: 6.000 créditos de Helius por pool
+        bulk_settle_s: int = 4,  # el índice en bloque puede ir alrededor de 1 s detrás del listado de firmas
+        idle_evict_s: int = 1200,
     ) -> None:
         self._rpc = rpc
         self._clock = clock
@@ -186,8 +224,20 @@ class SolanaMarketSource:
         self._mono = monotonic
         # Lectura concurrente de transacciones: con un proveedor de cupo alto multiplica el rendimiento de un pool
         # caliente, cuyo tráfico supera lo que una sola conexión secuencial (~5 tx/s) puede leer.
+        self._max_pages = max(1, max_signature_pages)
         self._concurrency = max(1, concurrency)
         self._executor = ThreadPoolExecutor(max_workers=self._concurrency, thread_name_prefix="rpc-tx") if self._concurrency > 1 else None
+        # Lectura en bloque (cientos de transacciones por solicitud). Si el proveedor no la admite se vuelve a la
+        # lectura de a una, que funciona con cualquier RPC pero no alcanza a seguir pools calientes con poco cupo.
+        self._bulk = bulk
+        self._bulk_confirmed = False
+        self._bulk_page = bulk_page
+        self._bulk_max_poll = bulk_max_per_poll
+        self._bulk_max_pool = bulk_max_per_pool
+        self._bulk_settle = bulk_settle_s
+        self._bulk_calls = self._bulk_txs = self._bulk_credits = 0
+        self._bulk_logged_at: datetime | None = None
+        self._idle_evict = idle_evict_s
         self._pools: dict[str, _PoolState] = {}
 
     # ------------------------------------------------------------------ estado por pool
@@ -200,7 +250,11 @@ class SolanaMarketSource:
                 fields = parse_pool_account(info["data"][0])
             if not fields:
                 raise RuntimeError("no se pudieron leer las bóvedas del pool")
-            st = _PoolState(base_vault=fields["base_vault"], quote_vault=fields["quote_vault"])
+            st = _PoolState(
+                base_vault=fields["base_vault"],
+                quote_vault=fields["quote_vault"],
+                virtual=fields["virtual_quote_reserves"],
+            )
             self._pools[pool.address] = st
         return st
 
@@ -216,12 +270,22 @@ class SolanaMarketSource:
         # cada ciclo: en un pool caliente son páginas de 1000 firmas por ciclo y el listado dominaba el tiempo.
         new: list[dict[str, Any]] = []
         before: str | None = None
-        for _ in range(10):
+        for _ in range(self._max_pages):
             page = self._rpc.get_signatures_for_address(st.quote_vault, before=before, until=st.head_sig, limit=1000)
             new.extend(page)
             if len(page) < 1000:
                 break
             before = page[-1]["signature"]
+        else:
+            # Quedan firmas más antiguas sin listar: habría un hueco que las ventanas rellenarían con precio plano y
+            # cobertura completa, es decir, datos inventados. El pool deja de producir ventanas.
+            st.truncated = True
+            st.backlog.clear()
+            log.warning(
+                "historial del pool %s supera %d firmas sin leer: no se puede reconstruir y no se arman más ventanas",
+                pool.address[:8], self._max_pages * 1000,
+            )  # fmt: skip
+            return
         if new:
             st.head_sig = new[0]["signature"]  # el RPC devuelve de la más nueva a la más vieja
             st.backlog.extend(reversed(new))  # el pendiente se procesa de la más antigua a la más reciente
@@ -243,22 +307,124 @@ class SolanaMarketSource:
                     if tx is None:
                         stalled = True  # queda al frente del pendiente y se reintenta en el próximo ciclo
                         break
-                    try:
-                        rec = extract_swap(
-                            tx, pool_address=pool.address, mint=pool.mint, base_vault=st.base_vault,
-                            quote_vault=st.quote_vault, decimals=pool.decimals,
-                        )  # fmt: skip
-                    except (KeyError, ValueError, TypeError):
-                        st.unparsed_at.append(datetime.fromtimestamp(tx.get("blockTime") or 0, UTC))
-                        rec = None
-                    if rec is not None:
-                        st.swaps.append(rec)
+                    self._apply(pool, st, tx)
                     processed += 1
                 st.backlog.popleft()
         if not st.backlog:
             st.complete_until = started - timedelta(seconds=self._settle)
         elif st.swaps:
             st.complete_until = st.swaps[-1].at
+
+    def _apply(self, pool: PoolInfo, st: _PoolState, tx: dict[str, Any]) -> None:
+        """Incorpora una transacción al estado del pool; las que no se pueden interpretar bajan la cobertura."""
+        try:
+            rec = extract_swap(
+                tx, pool_address=pool.address, mint=pool.mint, base_vault=st.base_vault,
+                quote_vault=st.quote_vault, decimals=pool.decimals, virtual_quote_reserves=st.virtual,
+            )  # fmt: skip
+        except (KeyError, ValueError, TypeError):
+            st.unparsed_at.append(datetime.fromtimestamp(tx.get("blockTime") or 0, UTC))
+            return
+        if rec is not None:
+            st.swaps.append(rec)
+            st.virtual = rec.virtual_quote_reserves
+
+    # ------------------------------------------------------------------ lectura en bloque
+    def _window_end(self, pool: PoolInfo, t: datetime) -> int:
+        """Cantidad de ventanas del pool ya cerradas en el instante ``t``."""
+        return max(0, int((t - pool.migrated_at).total_seconds() // self._w))
+
+    def _poll_bulk(self, pool: PoolInfo, st: _PoolState) -> None:
+        """Lee lo posterior al cursor, de la más antigua a la más nueva.
+
+        El historial se da por completo hasta ``inicio - margen`` solo si una página llegó vacía o si ya se leyó una
+        transacción de ese instante o posterior. Una página incompleta no alcanza como prueba de que no hay más.
+        """
+        started = self._clock.now()
+        horizon = started - timedelta(seconds=self._bulk_settle)
+        closed_until: datetime | None = None
+        if st.complete_until is not None:
+            closed = self._window_end(pool, st.complete_until)
+            if st.caught_up and horizon < pool.migrated_at + timedelta(seconds=(closed + 1) * self._w):
+                return  # todavía no puede cerrar otra ventana: consultar ahora solo gastaría cupo
+            if closed:
+                closed_until = pool.migrated_at + timedelta(seconds=closed * self._w)
+
+        st.caught_up = False
+        deadline = None if self._poll_budget_s is None else self._mono() + self._poll_budget_s
+        read = 0
+        last_at: datetime | None = None
+        while not st.caught_up:
+            if st.read_count >= self._bulk_max_pool:
+                st.truncated = True
+                st.swaps.clear()
+                st.unparsed_at.clear()
+                log.warning(
+                    "historial del pool %s supera %d transacciones: se deja de leer y no se arman más ventanas",
+                    pool.address[:8], self._bulk_max_pool,
+                )  # fmt: skip
+                return
+            page = self._rpc.get_transactions_for_address(st.quote_vault, after=st.cursor, limit=self._bulk_page)
+            self._count_bulk(len(page))
+            if not page:
+                st.caught_up = True
+                break
+            signature = ((page[-1].get("transaction") or {}).get("signatures") or [""])[0]
+            if not signature or signature == st.cursor:
+                raise PermanentSourceError("getTransactionsForAddress: la respuesta no permite avanzar el cursor")
+            for tx in page:
+                at = datetime.fromtimestamp(tx["blockTime"], UTC) if tx.get("blockTime") else None
+                if at is not None:
+                    last_at = at
+                    if closed_until is not None and at < closed_until and not st.late_warned:
+                        st.late_warned = True
+                        log.warning(
+                            "pool %s: llegó tarde una transacción de una ventana ya cerrada (índice del proveedor atrasado)",
+                            pool.address[:8],
+                        )  # fmt: skip
+                self._apply(pool, st, tx)
+            st.cursor = signature
+            st.read_count += len(page)
+            read += len(page)
+            if last_at is not None and last_at >= horizon:
+                st.caught_up = True
+            elif read >= self._bulk_max_poll or (deadline is not None and self._mono() > deadline):
+                break  # sigue en el próximo ciclo desde el cursor
+        reached = horizon if st.caught_up else last_at
+        if reached is not None and (st.complete_until is None or reached > st.complete_until):
+            st.complete_until = reached
+
+    def _count_bulk(self, returned: int) -> None:
+        if not self._bulk_confirmed:
+            self._bulk_confirmed = True
+            log.info("lectura en bloque activa (getTransactionsForAddress)")
+        self._bulk_calls += 1
+        self._bulk_txs += returned
+        # tarifa documentada por Helius: 10 créditos cada 100 transacciones devueltas, redondeado hacia arriba
+        self._bulk_credits += 10 * max(1, -(-returned // 100))
+        now = self._clock.now()
+        if self._bulk_logged_at is None:
+            self._bulk_logged_at = now
+        elif (now - self._bulk_logged_at).total_seconds() >= BULK_STATS_EVERY_S:
+            self._bulk_logged_at = now
+            log.info(
+                "lectura en bloque acumulada: %d llamadas, %d transacciones, ~%d créditos",
+                self._bulk_calls, self._bulk_txs, self._bulk_credits,
+            )  # fmt: skip
+
+    def _sync(self, pool: PoolInfo, st: _PoolState) -> None:
+        if not self._bulk:
+            self._poll(pool, st)
+            return
+        try:
+            self._poll_bulk(pool, st)
+        except PermanentSourceError as exc:
+            if self._bulk_confirmed:
+                raise
+            # nunca funcionó con este proveedor: no hay cursor que conservar y se usa la lectura estándar
+            self._bulk = False
+            log.warning("el proveedor no admite la lectura en bloque (%s): las transacciones se leen de a una", exc)
+            self._poll(pool, st)
 
     def _refresh_concentration(self, pool: PoolInfo, st: _PoolState, now: datetime) -> None:
         if st.next_conc_at is not None and now < st.next_conc_at:
@@ -282,7 +448,15 @@ class SolanaMarketSource:
     # ------------------------------------------------------------------ ventanas
     def get_snapshots(self, pool: PoolInfo, now: datetime) -> list[MarketSnapshot]:
         st = self._state(pool)
-        self._poll(pool, st)
+        st.used_at = now
+        # los pools que dejaron de consultarse liberan su historial en memoria
+        idle = [a for a, s in self._pools.items() if s.used_at and (now - s.used_at).total_seconds() > self._idle_evict]
+        for address in idle:
+            del self._pools[address]
+        if not st.truncated:
+            self._sync(pool, st)
+        if st.truncated:
+            return []  # lo ya guardado queda como está y envejece: el candidato pasa a «datos pendientes»
         self._refresh_concentration(pool, st, now)
         return build_windows(
             pool, st.swaps, st.unparsed_at, window_s=self._w, horizon=min(st.complete_until or now, now - timedelta(seconds=self._lag)),
@@ -310,13 +484,16 @@ def build_windows(
     out: list[MarketSnapshot] = []
     prev_close = first.price
     reserves = (first.base_reserve, first.quote_reserve)
+    times = [s.at for s in ordered]
+    failed_at = sorted(unparsed_at)
     k = 0
     while True:
         ws = pool.migrated_at + timedelta(seconds=k * window_s)
         we = ws + timedelta(seconds=window_s)
         if we > horizon:
             break
-        inside = [s for s in ordered if ws <= s.at < we]
+        # búsqueda binaria: recorrer todos los swaps en cada ventana no escala con miles de transacciones por pool
+        inside = ordered[bisect_left(times, ws) : bisect_left(times, we)]
         trades = [s for s in inside if s.kind in ("buy", "sell") and s.price is not None]
         reserved = [s for s in inside if s.price is not None]
         if reserved:
@@ -331,7 +508,7 @@ def build_windows(
                 net[owner] += delta
         buys = [t for t in trades if t.kind == "buy"]
         sells = [t for t in trades if t.kind == "sell"]
-        failed = sum(1 for u in unparsed_at if ws <= u < we)
+        failed = bisect_left(failed_at, we) - bisect_left(failed_at, ws)
         coverage = Decimal(len(inside)) / Decimal(len(inside) + failed) if inside or failed else Decimal(1)
         out.append(
             MarketSnapshot(

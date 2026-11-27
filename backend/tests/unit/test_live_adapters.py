@@ -38,6 +38,7 @@ from app.infrastructure.solana_rpc import (
     MIGRATE_DISC,
     MIGRATE_V2_DISC,
     PumpMigrationSource,
+    RpcError,
     SolanaRpcClient,
     parse_migrations,
     parse_pool_account,
@@ -556,6 +557,29 @@ class TestMarket:
         source._poll(pool, state)
         assert [s.signature for s in state.swaps] == ["s1", "s2", "s3", "s4", "s5"] and not state.backlog
 
+    def test_truncated_history_produces_no_windows_instead_of_inventing_them(self, caplog):
+        class Rpc(FakeRpc):
+            listed = 0
+            fetched = 0
+
+            def get_signatures_for_address(self, address, *, before=None, until=None, limit=1000):
+                self.listed += 1
+                return [{"signature": f"p{self.listed}-{i}", "slot": 1, "err": None} for i in range(limit)]  # siempre hay más
+
+            def get_transaction(self, sig):
+                self.fetched += 1
+                return None
+
+        rpc = Rpc()
+        rpc.accounts[POOL] = {"owner": PUMPSWAP_PROGRAM_ID, "data": [pool_account_b64(), "base64"]}
+        source = SolanaMarketSource(rpc, clock=ManualClock(NOW + timedelta(minutes=5)), max_signature_pages=3)
+        pool = PoolInfo(POOL, MINT, "T", "Token", 6, PUMPSWAP_PROGRAM_ID, WSOL_MINT, NOW, SIG, 0, 1, True, True, True)
+        with caplog.at_level("WARNING", logger="app.infrastructure.solana_market"):
+            assert source.get_snapshots(pool, NOW + timedelta(minutes=5)) == []
+            assert source.get_snapshots(pool, NOW + timedelta(minutes=6)) == []
+        assert rpc.listed == 3 and rpc.fetched == 0  # no se gasta cupo en un pool que no se puede reconstruir
+        assert sum("no se arman más ventanas" in r.message for r in caplog.records) == 1
+
     def test_poll_time_budget_leaves_the_rest_for_the_next_cycle(self):
         rpc = FakeRpc()
         rpc.accounts[POOL] = {"owner": PUMPSWAP_PROGRAM_ID, "data": [pool_account_b64(), "base64"]}
@@ -812,3 +836,298 @@ def test_log_redaction_hides_keys_and_credentials():
     assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in redact("https://rpc.example/AAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     assert "x-api-key=***" in redact("x-api-key=abcd1234")
     assert redact("migración verificada") == "migración verificada"
+
+
+def test_log_formatter_redacts_exception_tracebacks_too():
+    import logging
+    import sys
+
+    from app.logging_config import RedactingFormatter
+
+    try:
+        raise ValueError("fallo contra https://mainnet.helius-rpc.com/?api-key=clave-de-prueba-123")
+    except ValueError:
+        record = logging.LogRecord("x", logging.ERROR, __file__, 1, "falló %s", ("el paso",), sys.exc_info())
+    text = RedactingFormatter("%(message)s").format(record)
+    assert "Traceback" in text and "falló el paso" in text
+    assert "clave-de-prueba-123" not in text and "api-key=***" in text
+
+
+def test_stored_source_errors_are_redacted_before_the_api_can_show_them(uow):
+    with uow() as u:
+        u.checkpoints.mark_failure("solana_rpc", "market", NOW, "Boom: wss://x.example/?api-key=clave-de-prueba-123")
+    with uow() as u:
+        stored = u.checkpoints.get("solana_rpc", "market").last_error
+    assert "clave-de-prueba-123" not in stored and "api-key=***" in stored
+
+
+# ----------------------------------------------------------------------------- lectura en bloque
+class TestBulkClient:
+    def test_asks_for_successful_transactions_after_the_cursor_in_ascending_order(self):
+        seen = []
+
+        def handler(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json={"result": {"data": [{"slot": 1}], "paginationToken": "1:0"}})
+
+        client, _ = rpc_with(handler)
+        assert client.get_transactions_for_address("vault") == [{"slot": 1}]
+        assert client.get_transactions_for_address("vault", after="sigA", limit=7) == [{"slot": 1}]
+        assert [s["method"] for s in seen] == ["getTransactionsForAddress"] * 2
+        first, second = (s["params"][1] for s in seen)
+        assert first["filters"] == {"status": "succeeded"} and first["sortOrder"] == "asc" and first["limit"] == 500
+        assert first["transactionDetails"] == "full" and first["encoding"] == "jsonParsed" and first["maxSupportedTransactionVersion"] == 1
+        assert second["filters"] == {"status": "succeeded", "signature": {"gt": "sigA"}} and second["limit"] == 7
+
+    def test_follows_the_node_hint_for_a_newer_transaction_version(self):
+        seen = []
+        message = 'Please try again with "maxSupportedTransactionVersion": 2'
+
+        def handler(request):
+            version = json.loads(request.content)["params"][1]["maxSupportedTransactionVersion"]
+            seen.append(version)
+            if version < 2:
+                return httpx.Response(200, json={"error": {"code": -32015, "message": message}})
+            return httpx.Response(200, json={"result": {"data": []}})
+
+        client, _ = rpc_with(handler)
+        assert client.get_transactions_for_address("vault") == [] and seen == [1, 2]
+
+    @pytest.mark.parametrize("result", [None, [], {"data": None}, {"otra": 1}])
+    def test_unexpected_shape_is_an_error_and_never_an_empty_history(self, result):
+        client, _ = rpc_with(lambda r: httpx.Response(200, json={"result": result}))
+        with pytest.raises(PermanentSourceError):
+            client.get_transactions_for_address("vault")
+
+
+def chain(count, *, start=1, step_s=1.0):
+    """``count`` compras consecutivas (n.º ``start`` en adelante), una cada ``step_s`` segundos desde la migración."""
+    out = []
+    for n in range(start, start + count):
+        prev = (100_000 - n + 1, 1_000 + n - 1) if n > 1 else (0, 0)
+        at = NOW + timedelta(seconds=int(n * step_s))
+        out.append(swap_tx(t=at, pre_b=prev[0], post_b=100_000 - n, pre_q=prev[1], post_q=1_000 + n, sig=f"s{n}"))
+    return out
+
+
+class BulkRpc(FakeRpc):
+    """Historial en memoria (de la más antigua a la más nueva) con las dos formas de lectura."""
+
+    def __init__(self, txs=(), *, short_page=None):
+        super().__init__()
+        self.history: list[dict] = list(txs)
+        self.short_page = short_page  # el proveedor devuelve menos de lo pedido aunque haya más
+        self.bulk_calls: list[str | None] = []
+        self.accounts[POOL] = {"owner": PUMPSWAP_PROGRAM_ID, "data": [pool_account_b64(), "base64"]}
+
+    def _sigs(self):
+        return [t["transaction"]["signatures"][0] for t in self.history]
+
+    def get_transactions_for_address(self, address, *, after=None, limit=500):
+        assert address == VAULT_Q
+        self.bulk_calls.append(after)
+        start = 0 if after is None else self._sigs().index(after) + 1
+        return self.history[start : start + min(limit, self.short_page or limit)]
+
+    def get_signatures_for_address(self, address, *, before=None, until=None, limit=1000):
+        newest_first = [{"signature": s, "slot": 1, "err": None} for s in reversed(self._sigs())]
+        out = []
+        for e in newest_first:
+            if e["signature"] == until:
+                break
+            out.append(e)
+        return out
+
+    def get_transaction(self, sig):
+        return self.history[self._sigs().index(sig)]
+
+    def get_token_supply(self, mint):
+        raise TransientSourceError("sin concentración en esta prueba")
+
+
+def bulk_source(rpc, *, at_s=300, **kw):
+    clock = ManualClock(NOW + timedelta(seconds=at_s))
+    return SolanaMarketSource(rpc, clock=clock, bulk=True, **kw), clock
+
+
+class TestBulkMarket:
+    pool = PoolInfo(POOL, MINT, "T", "Token", 6, PUMPSWAP_PROGRAM_ID, WSOL_MINT, NOW, SIG, 0, 1, True, True, True)
+
+    def poll(self, source):
+        state = source._state(self.pool)
+        source._sync(self.pool, state)
+        return state
+
+    def test_builds_the_same_windows_as_reading_one_transaction_at_a_time(self):
+        history = chain(120)
+        one_by_one = SolanaMarketSource(BulkRpc(history), clock=ManualClock(NOW + timedelta(seconds=300)), max_tx_per_poll=1000, settle_s=4)
+        bulk, _ = bulk_source(BulkRpc(history), bulk_page=25)
+        expected = one_by_one.get_snapshots(self.pool, NOW + timedelta(seconds=300))
+        got = bulk.get_snapshots(self.pool, NOW + timedelta(seconds=300))
+        assert len(got) == 19 and got == expected  # ventanas cerradas hasta 300 s − 4 s de margen
+        assert sum(w.swap_count for w in got) == 119  # la primera transacción es la creación del pool
+
+    def test_a_short_page_is_not_taken_as_the_end_of_the_history(self):
+        rpc = BulkRpc(chain(10), short_page=3)
+        source, _ = bulk_source(rpc)
+        state = self.poll(source)
+        assert [s.signature for s in state.swaps] == [f"s{i}" for i in range(1, 11)]
+        assert rpc.bulk_calls == [None, "s3", "s6", "s9", "s10"]  # solo la página vacía confirma que no hay más
+        assert state.caught_up and state.complete_until == NOW + timedelta(seconds=296)
+
+    def test_stops_without_an_extra_call_once_it_reads_past_the_horizon(self):
+        rpc = BulkRpc(chain(10))
+        source, _ = bulk_source(rpc, at_s=12)  # horizonte en 8 s: la página ya llega hasta 10 s
+        state = self.poll(source)
+        assert rpc.bulk_calls == [None] and state.caught_up
+        assert state.complete_until == NOW + timedelta(seconds=8)
+
+    def test_when_the_time_budget_runs_out_history_is_complete_only_up_to_what_was_read(self):
+        rpc = BulkRpc(chain(40))
+        ticks = iter([0.0, 9.0, 100.0, 109.0])
+        source, _ = bulk_source(rpc, bulk_page=10, poll_budget_s=5.0, monotonic=lambda: next(ticks))
+        state = self.poll(source)
+        assert not state.caught_up and state.cursor == "s10"
+        assert state.complete_until == NOW + timedelta(seconds=10)
+        windows = build_windows(self.pool, state.swaps, [], window_s=15, horizon=state.complete_until, lag_s=2, conc=None, conc_at=None, source="t")
+        assert windows == []  # la primera ventana todavía no está completa: no se rellena con precio plano
+        self.poll(source)
+        assert rpc.bulk_calls == [None, "s10"] and state.cursor == "s20"  # sigue desde el cursor, sin releer
+
+    def test_per_poll_cap_leaves_the_rest_for_the_next_cycle(self):
+        rpc = BulkRpc(chain(40))
+        source, _ = bulk_source(rpc, bulk_page=10, bulk_max_per_poll=20)
+        state = self.poll(source)
+        assert len(state.swaps) == 20 and not state.caught_up
+        self.poll(source)
+        assert len(state.swaps) == 40 and not state.caught_up  # justo en el tope: falta confirmar que no hay más
+        self.poll(source)
+        assert state.caught_up and len(state.swaps) == 40
+
+    def test_does_not_query_again_until_another_window_can_close(self):
+        rpc = BulkRpc(chain(10))
+        source, clock = bulk_source(rpc, at_s=40)  # completo hasta 36 s: la próxima ventana cierra a los 45 s
+        self.poll(source)
+        calls = len(rpc.bulk_calls)
+        clock.set(NOW + timedelta(seconds=48))  # horizonte 44 s
+        self.poll(source)
+        assert len(rpc.bulk_calls) == calls
+        rpc.history += chain(1, start=11, step_s=4)  # n.º 11 a los 44 s
+        clock.set(NOW + timedelta(seconds=49))  # horizonte 45 s
+        state = self.poll(source)
+        assert len(rpc.bulk_calls) > calls and state.swaps[-1].signature == "s11"
+        assert state.complete_until == NOW + timedelta(seconds=45)
+
+    def test_a_late_transaction_in_a_closed_window_is_reported_once(self, caplog):
+        rpc = BulkRpc(chain(5))
+        source, clock = bulk_source(rpc, at_s=40)
+        self.poll(source)
+        rpc.history += chain(2, start=6, step_s=2)  # a los 12 s y 14 s: dentro de una ventana ya cerrada
+        clock.set(NOW + timedelta(seconds=70))
+        with caplog.at_level("WARNING", logger="app.infrastructure.solana_market"):
+            self.poll(source)
+        assert sum("llegó tarde" in r.message for r in caplog.records) == 1
+
+    def test_per_pool_cap_stops_reading_and_produces_no_windows(self, caplog):
+        rpc = BulkRpc(chain(50))
+        source, _ = bulk_source(rpc, bulk_page=10, bulk_max_per_pool=20)
+        with caplog.at_level("WARNING", logger="app.infrastructure.solana_market"):
+            assert source.get_snapshots(self.pool, NOW + timedelta(seconds=300)) == []
+            assert source.get_snapshots(self.pool, NOW + timedelta(seconds=320)) == []
+        assert len(rpc.bulk_calls) == 2
+        assert sum("no se arman más ventanas" in r.message for r in caplog.records) == 1
+
+    def test_falls_back_to_one_by_one_when_the_provider_lacks_the_method(self, caplog):
+        class NoBulk(BulkRpc):
+            def get_transactions_for_address(self, address, *, after=None, limit=500):
+                self.bulk_calls.append(after)
+                raise RpcError("getTransactionsForAddress", -32601, "Method not found")
+
+        rpc = NoBulk(chain(10))
+        source, clock = bulk_source(rpc)
+        with caplog.at_level("WARNING", logger="app.infrastructure.solana_market"):
+            state = self.poll(source)
+            clock.set(NOW + timedelta(seconds=330))
+            self.poll(source)
+        assert len(state.swaps) == 10 and len(rpc.bulk_calls) == 1  # no se vuelve a intentar
+        assert sum("no admite la lectura en bloque" in r.message for r in caplog.records) == 1
+
+    def test_does_not_fall_back_once_bulk_reading_has_worked(self):
+        class Flaky(BulkRpc):
+            broken = False
+
+            def get_transactions_for_address(self, address, *, after=None, limit=500):
+                if self.broken:
+                    raise PermanentSourceError("HTTP 400")
+                return super().get_transactions_for_address(address, after=after, limit=limit)
+
+        rpc = Flaky(chain(10))
+        source, clock = bulk_source(rpc)
+        self.poll(source)
+        rpc.broken = True
+        clock.set(NOW + timedelta(seconds=330))
+        with pytest.raises(PermanentSourceError):
+            self.poll(source)
+
+    def test_a_rate_limited_first_call_keeps_bulk_mode(self):
+        class Limited(BulkRpc):
+            limited = True
+
+            def get_transactions_for_address(self, address, *, after=None, limit=500):
+                if self.limited:
+                    raise TransientSourceError("HTTP 429")
+                return super().get_transactions_for_address(address, after=after, limit=limit)
+
+        rpc = Limited(chain(10))
+        source, _ = bulk_source(rpc)
+        with pytest.raises(TransientSourceError):
+            self.poll(source)
+        rpc.limited = False
+        assert len(self.poll(source).swaps) == 10 and rpc.bulk_calls
+
+    def test_counts_documented_credits_and_logs_the_total_periodically(self, caplog):
+        rpc = BulkRpc(chain(150))
+        source, clock = bulk_source(rpc, bulk_page=120)
+        with caplog.at_level("INFO", logger="app.infrastructure.solana_market"):
+            self.poll(source)  # 120 tx = 20 créditos, 30 tx = 10 y la página vacía = 10
+            assert (source._bulk_calls, source._bulk_txs, source._bulk_credits) == (3, 150, 40)
+            clock.set(NOW + timedelta(seconds=700))
+            self.poll(source)
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages.count("lectura en bloque activa (getTransactionsForAddress)") == 1
+        assert "lectura en bloque acumulada: 4 llamadas, 150 transacciones, ~50 créditos" in messages
+
+    def test_idle_pools_release_their_history(self):
+        source, clock = bulk_source(BulkRpc(chain(10)))
+        source.get_snapshots(self.pool, clock.now())
+        other = PoolInfo(key("otro-pool"), MINT, "T", "Token", 6, PUMPSWAP_PROGRAM_ID, WSOL_MINT, NOW, SIG, 0, 1, True, True, True)
+        source._rpc.accounts[other.address] = source._rpc.accounts[POOL]
+        source.get_snapshots(other, clock.now() + timedelta(seconds=1201))
+        assert list(source._pools) == [other.address]
+
+
+def test_rpc_client_spaces_requests_to_the_configured_rate():
+    now = {"t": 100.0}
+    sleeps: list[float] = []
+
+    def sleep(s):
+        sleeps.append(round(s, 3))
+        now["t"] += s
+
+    client = SolanaRpcClient(
+        "https://rpc.example", http=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"result": 1}))),
+        max_rps=10, sleep=sleep, monotonic=lambda: now["t"],
+    )  # fmt: skip
+    for _ in range(4):
+        client.call("getSlot", [])
+    assert sleeps == [0.1, 0.1, 0.1]  # la primera sale ya; las siguientes, cada 100 ms
+    now["t"] += 5  # tras una pausa no acumula turnos: sale de inmediato
+    client.call("getSlot", [])
+    assert len(sleeps) == 3
+
+
+def test_rpc_client_without_rate_limit_never_waits():
+    client, sleeps = rpc_with(lambda r: httpx.Response(200, json={"result": 1}))
+    for _ in range(5):
+        client.call("getSlot", [])
+    assert sleeps == []

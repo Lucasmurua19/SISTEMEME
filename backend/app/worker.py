@@ -63,11 +63,13 @@ class Worker:
         real_clock: Clock | None = None,
         evaluation_budget_s: float | None = None,
         slow_step_s: float = 15.0,
+        skip_terminal_pools: bool = False,
     ) -> None:
         self.uow = uow_factory
         self.clock = clock
         self.real_clock = real_clock or SystemClock()
         self.evaluation_budget_s = evaluation_budget_s  # None = evaluar todos los pools (fixtures)
+        self.skip_terminal_pools = skip_terminal_pools  # live: no gastar cupo en pools descartados para siempre
         self.slow_step_s = slow_step_s
         self.migrations = migrations
         self.market = market
@@ -181,7 +183,7 @@ class Worker:
             lambda: evaluate_pools(
                 uow_factory=self.uow, market=self.market, quotes=self.quotes, clock=self.clock,
                 version_id=self.version_id, cfg=self.cfg,
-                budget_s=self.evaluation_budget_s, progress=self._heartbeat,
+                budget_s=self.evaluation_budget_s, progress=self._heartbeat, skip_terminal=self.skip_terminal_pools,
             ),
         )  # fmt: skip
         for o in outcomes or []:

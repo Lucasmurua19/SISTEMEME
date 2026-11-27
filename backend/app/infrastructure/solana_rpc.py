@@ -8,8 +8,10 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -52,6 +54,23 @@ _OFF_QUOTE_MINT = 75
 _OFF_LP_MINT = 107
 _OFF_BASE_VAULT = 139
 _OFF_QUOTE_VAULT = 171
+# Reserva virtual del lado SOL (i128 con signo). PumpSwap cotiza sobre «bóveda + reserva virtual»: positiva en los pools
+# con aporte virtual, apenas negativa cuando retienen comisiones en la bóveda. Las cuentas anteriores al campo son más
+# cortas y valen 0. https://github.com/pump-fun/pump-public-docs
+_OFF_VIRTUAL_QUOTE = 245
+
+# Eventos de swap de pump_amm. Se emiten como autoinvocación (quedan en las instrucciones internas, que a diferencia de
+# los logs no se truncan). Posiciones en bytes desde el discriminador del evento.
+EVENT_CPI_DISC = bytes.fromhex("e445a52e51cb9a1d")
+BUY_EVENT_DISC = bytes([103, 244, 82, 31, 44, 245, 119, 119])
+SELL_EVENT_DISC = bytes([62, 47, 55, 10, 165, 3, 220, 42])
+_EV_BASE_AMOUNT = 16
+_EV_BASE_RESERVES = 48  # reservas anteriores al swap
+_EV_QUOTE_RESERVES = 56
+_EV_QUOTE_WITH_LP_FEE = 104  # compra: SOL que entra al pool; venta: SOL que sale
+_EV_POOL = 120
+_EV_SELL_VIRTUAL = 392
+_EV_BUY_IX_NAME = 401  # largo (u32) y texto; la reserva virtual sigue 32 bytes después
 
 _TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504}
 _TRANSIENT_RPC_CODES = {-32005, -32004, -32009, -32014, -32016}  # nodo no sano, bloque no disponible, etc.
@@ -85,7 +104,15 @@ class SolanaRpcClient:
         http: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
         max_total_wait_s: float = 12.0,
+        max_rps: float = 0.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        # Ritmo máximo de solicitudes (0 = sin tope). Los planes de proveedor limitan por segundo: autolimitarse evita
+        # los 429 y sus esperas. Es compartido entre hilos porque la lectura de transacciones es concurrente.
+        self._min_interval = 1.0 / max_rps if max_rps > 0 else 0.0
+        self._next_slot = 0.0
+        self._rate_lock = threading.Lock()
+        self._mono = monotonic
         self._url = url
         self.commitment = commitment
         self._http = http or httpx.Client(timeout=timeout)
@@ -105,6 +132,7 @@ class SolanaRpcClient:
         waited = 0.0
         for attempt in range(max_retries + 1):
             wait = self._backoff * (2**attempt)
+            self._throttle()
             try:
                 resp = self._http.post(self._url, json=payload)
             except httpx.TransportError as exc:  # red caída, timeout, DNS…  (sin URL en el mensaje)
@@ -137,6 +165,17 @@ class SolanaRpcClient:
             waited += wait
         raise TransientSourceError(f"{method}: reintentos agotados ({last})")
 
+    def _throttle(self) -> None:
+        """Reserva el próximo turno según ``max_rps`` y espera hasta él (fuera del candado)."""
+        if not self._min_interval:
+            return
+        with self._rate_lock:
+            now = self._mono()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + self._min_interval
+        if slot > now:
+            self._sleep(slot - now)
+
     # --- métodos usados por el radar
     def get_signatures_for_address(
         self, address: str, *, before: str | None = None, until: str | None = None, limit: int = 1000
@@ -148,22 +187,50 @@ class SolanaRpcClient:
             cfg["until"] = until
         return self.call("getSignaturesForAddress", [address, cfg]) or []
 
-    def get_transaction(self, signature: str) -> dict[str, Any] | None:
+    def _call_versioned(self, method: str, params: Callable[[int], list[Any]]) -> Any:
+        """Llamada que declara la versión máxima de transacción; si el nodo pide una mayor, se reintenta con ella."""
         version = self._tx_version
         for _ in range(2):
             try:
-                tx = self.call(
-                    "getTransaction",
-                    [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": version, "commitment": self.commitment}],
-                )
+                result = self.call(method, params(version))
                 self._tx_version = version  # recuerda la versión aceptada para las llamadas siguientes
-                return tx
+                return result
             except RpcError as exc:
                 hint = _TX_VERSION_HINT.search(exc.node_message) if exc.code == TX_VERSION_ERROR_CODE else None
                 if hint is None or int(hint.group(1)) <= version or int(hint.group(1)) > 255:
                     raise
                 version = int(hint.group(1))
-        raise PermanentSourceError("getTransaction: versión de transacción no soportada")
+        raise PermanentSourceError(f"{method}: versión de transacción no soportada")
+
+    def get_transaction(self, signature: str) -> dict[str, Any] | None:
+        return self._call_versioned(
+            "getTransaction",
+            lambda version: [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": version, "commitment": self.commitment}],
+        )
+
+    def get_transactions_for_address(self, address: str, *, after: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        """Lectura en bloque. Es una extensión de Helius: no forma parte del RPC estándar de Solana.
+
+        Devuelve las transacciones **exitosas** que referencian ``address`` y son posteriores a la firma ``after``
+        (sin incluirla), de la más antigua a la más nueva y con el mismo contenido que ``getTransaction``. Solo una
+        lista vacía asegura que no hay más.
+        """
+        filters: dict[str, Any] = {"status": "succeeded"}
+        if after:
+            filters["signature"] = {"gt": after}
+
+        def params(version: int) -> list[Any]:
+            cfg = {
+                "transactionDetails": "full", "sortOrder": "asc", "limit": limit, "encoding": "jsonParsed",
+                "maxSupportedTransactionVersion": version, "commitment": self.commitment, "filters": filters,
+            }  # fmt: skip
+            return [address, cfg]
+
+        result = self._call_versioned("getTransactionsForAddress", params)
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, list):
+            raise PermanentSourceError("getTransactionsForAddress: respuesta con formato inesperado")
+        return data
 
     def get_account_info(self, pubkey: str) -> dict[str, Any] | None:
         res = self.call("getAccountInfo", [pubkey, {"encoding": "base64", "commitment": self.commitment}])
@@ -306,7 +373,56 @@ def parse_migrations(
     return events
 
 
-def parse_pool_account(data_b64: str) -> dict[str, str] | None:
+@dataclass(frozen=True)
+class PoolReserves:
+    """Reservas sobre las que cotiza un pool de PumpSwap: ``quote`` es la efectiva (bóveda + reserva virtual)."""
+
+    base: int
+    quote: int
+
+
+def _state_after_event(raw: bytes, pool: bytes) -> PoolReserves | None:
+    disc = raw[:8]
+    if disc == SELL_EVENT_DISC:
+        virtual_at = _EV_SELL_VIRTUAL
+    elif disc == BUY_EVENT_DISC and len(raw) >= _EV_BUY_IX_NAME + 4:
+        virtual_at = _EV_BUY_IX_NAME + 4 + int.from_bytes(raw[_EV_BUY_IX_NAME : _EV_BUY_IX_NAME + 4], "little") + 32
+    else:
+        return None
+    if len(raw) < virtual_at + 16 or raw[_EV_POOL : _EV_POOL + 32] != pool:
+        return None
+
+    def u64(off: int) -> int:
+        return int.from_bytes(raw[off : off + 8], "little")
+
+    virtual = int.from_bytes(raw[virtual_at : virtual_at + 16], "little", signed=True)
+    sign = 1 if disc == BUY_EVENT_DISC else -1
+    return PoolReserves(
+        base=u64(_EV_BASE_RESERVES) - sign * u64(_EV_BASE_AMOUNT),
+        quote=u64(_EV_QUOTE_RESERVES) + virtual + sign * u64(_EV_QUOTE_WITH_LP_FEE),
+    )
+
+
+def reserves_after_swap(tx: dict[str, Any], pool_address: str) -> PoolReserves | None:
+    """Estado del pool después de su último swap en la transacción; ``None`` si no hay un evento legible.
+
+    Cada evento informa las reservas anteriores al swap y la reserva virtual vigente. El estado posterior sale de
+    sumar (compra) o restar (venta) lo que entra o sale del pool, comisión de LP incluida; las comisiones que el pool
+    retiene en la bóveda no cuentan para el precio.
+    """
+    pool = base58.b58decode(pool_address)
+    last: PoolReserves | None = None
+    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
+        for ins in group.get("instructions") or []:
+            if ins.get("programId") != PUMPSWAP_PROGRAM_ID:
+                continue
+            data = _data(ins)
+            if data[:8] == EVENT_CPI_DISC:
+                last = _state_after_event(data[8:], pool) or last
+    return last
+
+
+def parse_pool_account(data_b64: str) -> dict[str, Any] | None:
     """Campos del Pool de pump_amm (offsets tras el discriminador); ``None`` si la cuenta es más corta."""
     raw = base64.b64decode(data_b64)
     if len(raw) < POOL_MIN_LEN:
@@ -322,6 +438,9 @@ def parse_pool_account(data_b64: str) -> dict[str, str] | None:
         "lp_mint": pk(_OFF_LP_MINT),
         "base_vault": pk(_OFF_BASE_VAULT),
         "quote_vault": pk(_OFF_QUOTE_VAULT),
+        "virtual_quote_reserves": int.from_bytes(raw[_OFF_VIRTUAL_QUOTE : _OFF_VIRTUAL_QUOTE + 16], "little", signed=True)
+        if len(raw) >= _OFF_VIRTUAL_QUOTE + 16
+        else 0,
     }
 
 

@@ -69,13 +69,34 @@ Antes de evaluar señales en vivo, mirá el indicador de estado del panel: una f
 
 **El ciclo del worker está acotado en tiempo** (`INGEST_BUDGET_S`, `POLL_BUDGET_S`, `EVALUATION_BUDGET_S`): con un RPC lento, lo que no alcanza se retoma en el ciclo siguiente en vez de bloquear el latido, los trabajos y el seguimiento de posiciones abiertas. El log registra el tiempo de cada paso y avisa cuando uno es lento.
 
+### Instancia live aparte de la de fixtures
+
+Con un nombre de proyecto propio, Compose crea contenedores y base separados, así los datos reales no se mezclan con los sintéticos:
+
+```powershell
+Copy-Item .env .env.live     # Git ignora .env.*: la clave nunca debe quedar en un commit
+# editá .env.live: DATA_MODE=live, SOLANA_RPC_URL, SOLANA_WS_URL, STRATEGY_CONFIG_PATH= (vacío = live-v1),
+#                  RPC_CONCURRENCY=2, RPC_MAX_RPS=9, WEB_PORT=3001, API_PORT=8001
+docker compose --env-file .env.live -p radar-live up -d --build
+docker compose --env-file .env.live -p radar-live logs -f worker
+docker compose --env-file .env.live -p radar-live down      # detiene; agregá -v solo si querés borrar sus datos
+```
+
+Panel en http://localhost:3001 y API en http://localhost:8001/docs. `RPC_MAX_RPS` va apenas por debajo del límite de tu plan (con 10 solicitudes por segundo, 9) para evitar respuestas 429.
+
+**Lectura en bloque.** Con Helius, el historial de cada pool se lee con `getTransactionsForAddress` (hasta cientos de transacciones por solicitud) en vez de pedirlas de a una, que con 10 solicitudes por segundo no alcanza a seguir los pools activos. Un pool que está al día se vuelve a consultar solo cuando puede cerrar otra ventana de 15 s. Si el proveedor no tiene ese método, se detecta en la primera consulta, se avisa en el log y se lee de a una; `RPC_BULK_HISTORY=false` la desactiva.
+
+**Consumo del plan.** Según la [tabla de Helius](https://www.helius.dev/docs/billing/credits), la lectura en bloque cuesta 10 créditos cada 100 transacciones devueltas, con un mínimo de 10 por consulta; el gasto depende de cuántos pools haya activos y de su tráfico. El log registra cada 5 minutos el acumulado estimado de la lectura en bloque (no incluye las demás llamadas). Con la lectura de a una son hasta unas 32.000 llamadas por hora. Revisá el consumo en el panel de tu proveedor y detené la instancia cuando no estés midiendo. No ejecutes `docker compose ... config` ni `docker inspect` delante de otros: muestran la URL con la clave.
+
+**Medición desatendida.** `python scripts/medir_live.py --horas 5 --detener` registra el estado cada 10 minutos, escribe un informe en `reportes/` y detiene la instancia (los datos se conservan). Sin argumentos, informa el estado actual.
+
 ## Cómo decide el sistema
 
 1. **Ingesta.** Se detecta la instrucción `migrate` de Pump.fun, se valida programa, mint y pool contra la cuenta real en PumpSwap y se guarda con firma, índice de instrucción, slot y los tres instantes (`event_at`, `observed_at`, `evaluated_at`). El checkpoint avanza en la misma transacción que los eventos.
 2. **Patrón.** Máximo inicial en una ventana configurable → caída entre un mínimo y un máximo admisibles → recuperación confirmada con ventanas cerradas consecutivas. Al confirmar, máximo, mínimo y nivel de invalidación **quedan congelados**: ventanas futuras no reescriben la señal.
 3. **Filtros obligatorios** (cada uno deja motivo, valor y umbral): migración verificada, identidad mint–pool, edad, datos frescos, concentración evaluable y aceptable, patrón confirmado, compradores netos, profundidad, estabilidad de liquidez, ruta de compra y venta, cotización vigente y costo de ida y vuelta.
 4. **Puntaje** 0–100 sin redondear: recuperación 40 % · liquidez 30 % · costo 20 % · holders 10 %, con rangos fijos por versión (no depende de otros candidatos). Desempate por costo y por frescura de la cotización.
-5. **Simulación.** Reserva de capital al admitir la señal → entrada con cotización nueva tras el retraso (rechazo registrado si cambió precio, ruta o costo) → valoración conservadora → salida por invalidación, deterioro de liquidez, objetivo o tiempo máximo. Una venta fallida **deja la posición abierta**, registra la causa y reintenta con más tolerancia de slippage; una posición sin ruta se muestra aparte con escenario de recuperación cero.
+5. **Simulación.** Reserva de capital al admitir la señal → entrada con cotización nueva tras el retraso (rechazo registrado si cambió precio, ruta o costo) → valoración conservadora → salida por invalidación, deterioro de liquidez, objetivo o tiempo máximo. Una venta fallida **deja la posición abierta**, registra la causa, actualiza la valoración y reintenta tras una espera creciente con más tolerancia de slippage. Cada intento se compara con la cotización tomada al programarlo (el precio que disparó la salida queda registrado en el primero). Una posición sin ruta se muestra aparte con escenario de recuperación cero.
 6. **Evaluación.** Dos sesiones con el mismo universo, presupuesto, retrasos y reglas: *ranking por puntaje* contra *referencia por liquidez*. PnL neto en SOL y USD, expectativa, tasa de acierto, caída máxima del PnL realizado, PnL sin la mejor operación, escenario adverso, posiciones con salida fallida y bloque cronológico (`since`/`until`).
 
    **Cómo leer el resultado de una sesión.** El panel muestra tres cifras con el mismo peso: *PnL realizado* (solo ventas ya ejecutadas), *Abiertas valoradas* y *Total valorado* (la suma). Las abiertas se valoran de forma conservadora: las que tienen ruta de salida, vendidas al mínimo garantizado y después de costos; las que no tienen ruta, a recuperación cero (pérdida del monto entero). Debajo se informa también la cota optimista (a precio cotizado) y la hora de la valoración más vieja. La *caída máxima del PnL realizado* se calcula solo con operaciones cerradas, por eso no incluye la pérdida latente de las abiertas; para ver ese riesgo mirá *Abiertas valoradas*. (Los documentos de especificación la llaman «caída máxima del capital»: el nombre se cambió a propósito para que no sugiera algo que el cálculo no hace.)
@@ -139,7 +160,7 @@ compose.yaml  .env.example
 ## Verificación realizada y límites conocidos
 
 **Verificado en este entorno**
-- 187 pruebas automáticas: reglas de dominio, flujo completo con fixtures (migración → señal → posición → PnL), API, migraciones (`upgrade`, `check` sin diferencias y `downgrade`), **PostgreSQL real** (tipos `NUMERIC(40,0)`/`JSONB`, enteros u64 exactos, cuatro workers compitiendo por las mismas señales, reclamos con `SKIP LOCKED`) y **transacciones reales de mainnet** capturadas como fixtures (`backend/tests/fixtures/solana_real/`).
+- 235 pruebas automáticas: reglas de dominio, flujo completo con fixtures (migración → señal → posición → PnL), API, migraciones (`upgrade`, `check` sin diferencias y `downgrade`), **PostgreSQL real** (tipos `NUMERIC(40,0)`/`JSONB`, enteros u64 exactos, cuatro workers compitiendo por las mismas señales, reclamos con `SKIP LOCKED`) y **transacciones reales de mainnet** capturadas como fixtures (`backend/tests/fixtures/solana_real/`).
 - Frontend: chequeo de tipos, build de producción y revisión visual con capturas (tema oscuro, claro y 500 px de ancho).
 - **`docker compose up --build` en Windows con Docker 26:** las imágenes se construyen, `migrate` aplica Alembic sobre PostgreSQL 16, y `db`, `api` y `web` quedan `healthy`. La reproducción de fixtures sobre ese PostgreSQL dio el mismo resultado exacto que las pruebas con SQLite.
 - **Modo `live` en solo lectura contra Solana y Jupiter reales** (2026-11-25, RPC público de Solana y Jupiter sin clave, base SQLite descartable). Se siguió una migración real de punta a punta con los adaptadores del sistema: firma → evento de migración → verificación on-chain del pool (cuenta real en PumpSwap, PDA canónica) → snapshots de mercado por ventanas → cotización de compra y de salida en Jupiter. Durante unos 12 minutos el worker detectó 13 migraciones reales por WebSocket y por reconciliación, y registró una evaluación real. Esa prueba encontró y corrigió defectos que las respuestas sintéticas no mostraban:
@@ -150,10 +171,14 @@ compose.yaml  .env.example
   - Un ciclo del worker se bloqueaba 55–96 s esperando al RPC (sin latido ni seguimiento de posiciones): ahora hay topes de tiempo, latido entre pools, concentración sin reintentos y con retroceso, y lectura concurrente.
   - Hay migraciones legítimas cuyo pool cotiza en **otro token de Pump.fun** y no en SOL (1 de 13); se rechazan con su propio motivo, `UNSUPPORTED_QUOTE_MINT`, sin gastar cotizaciones.
 
+- **Cinco horas en vivo con Helius** (2026-11-26, plan gratuito, lectura en bloque): 231 migraciones, detección mediana 2,2 s, atraso de pools activos 10 s al final, sin errores ni `429`, 49 señales y operaciones simuladas.
+- **Precio de PumpSwap contra swaps reales:** con la reserva virtual, x·y=k reprodujo 342 de 342 swaps de cinco pools (sin ella, 7), y el estado calculado tras cada swap coincidió con el previo del siguiente en 337 de 337 pares.
+
 **No verificado (decílo antes de confiar en ello)**
-- **Operación sostenida en vivo.** La prueba duró minutos con el RPC público, que limita la tasa: no se vio cómo se comporta durante horas o días ni con un proveedor de cupo propio.
-- **Ninguna migración real llegó a señal ni a posición simulada.** No es una conclusión sobre la estrategia: con el RPC público la concentración de holders queda desconocida (el filtro queda pendiente), el sondeo de swaps no alcanzó a los pools calientes y las reservas iniciales observadas fueron muy dispares (0,14 SOL, 0,29 SOL y 70,9 SOL en las tres que se midieron, contra los 20 SOL que exige el filtro de profundidad). Por eso la cotización de salida se verificó con los adaptadores sobre un pool real, pero **no a través de una evaluación completa del worker**.
-- Latencia de ingesta: entre el bloque y el registro pasaron entre 1,6 y 30 s (mediana ≈ 11 s). Los trabajos disparados por WebSocket esperan al paso de evaluación del ciclo; un RPC con más cupo la reduce.
+- **Los PnL medidos hasta el 2026-11-26 no valen:** se obtuvieron con el precio sin reserva virtual y con reintentos de salida contra la referencia del primer disparo. Ambos defectos se corrigieron después; falta una corrida larga con las correcciones.
+- **Comparación Ranking / Liquidez:** las dos sesiones cotizan y ejecutan en momentos distintos (unos 4 s), así que la diferencia entre ambas mide sobre todo eso.
+- **Retraso de ejecución:** entradas y salidas esperan al paso de evaluación del ciclo; con 5 s configurados se midieron medianas de 10 a 15 s.
+- **Concentración de holders:** se vieron valores imposibles (más de 100 %); el filtro necesita revisión.
 - Los umbrales de `live-v1` no están calibrados y los resultados de fixtures son sintéticos: ninguno es evidencia de rentabilidad.
 - **Comparar Ranking y Liquidez durante varias sesiones todavía no es posible:** hay un único par de sesiones por versión de estrategia, y una sesión que alcanza su pérdida máxima queda pausada para siempre. Hace falta agregar «corridas» de sesión (par de sesiones nuevo por período, con las mismas reglas).
 
@@ -163,5 +188,6 @@ compose.yaml  .env.example
 - Compradores netos con confirmación de varias ventanas: se usa el máximo por ventana (cota inferior de wallets distintas).
 - Los depósitos de cuentas de token (reembolsables) se registran por separado y no cuentan como costo; sí cuentan como fondos inmovilizados (y como recuperación cero en posiciones ilíquidas).
 - Las cotizaciones de valoración de posiciones abiertas no se persisten salvo que fallen (evidencia de fallas); las de evaluación, entrada y salida sí.
-- Las salidas fallidas se reintentan sin tope de intentos, con tolerancia de slippage creciente hasta un máximo; tras `exit_retry_max` fallos la posición se marca ilíquida.
+- Las salidas fallidas se reintentan sin tope de intentos, con tolerancia de slippage creciente hasta un máximo; tras `exit_retry_max` fallos la posición se marca ilíquida. La espera arranca en `exit_retry_interval_s` y se duplica hasta 120 s (tope fijo en el código, fuera de la huella de la estrategia); mientras espera, la posición se revalora cada `exit_retry_interval_s`.
+- **Precio en PumpSwap:** se calcula sobre la reserva efectiva de SOL, «bóveda + reserva virtual» ([documentación de Pump](https://github.com/pump-fun/pump-public-docs)). El valor sale del evento de cada swap y, en la creación o los aportes de liquidez, del último conocido del pool. Los filtros de profundidad y retención siguen usando el SOL real de la bóveda.
 - Actualización del panel por *polling* configurable (`POLL_SECONDS`), como pide la arquitectura para el primer corte.

@@ -109,7 +109,7 @@ class TestFullReplay:
     def test_failed_sale_keeps_position_open_and_retries_until_route_returns(self, replay, session_factory):
         pos = positions_by_session(session_factory)["ranking"]["OMIC"]
         assert pos.status == "closed"
-        assert pos.exit_failures >= 3
+        assert pos.exit_failures >= 2  # los reintentos se espacian: en la caída de ruta del escenario entran dos
         with session_factory() as s:
             attempts = list(
                 s.scalars(

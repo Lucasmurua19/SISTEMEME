@@ -33,10 +33,20 @@ def check_rpc_url(rpc_url: str) -> None:
         )
 
 
+def check_ws_url(ws_url: str) -> None:
+    """Una URL de WebSocket sin completar solo produciría reconexiones sin fin: se avisa al arrancar."""
+    if EXAMPLE_PLACEHOLDER in ws_url:
+        raise RuntimeError(
+            "SOLANA_WS_URL conserva el valor de ejemplo: configurá la URL wss de tu proveedor (o dejala vacía "
+            "para reconciliar solo por RPC)"
+        )
+
+
 def build_live_sources(settings: Settings, uow: UnitOfWorkFactory, clock: Clock):
     rpc_url = settings.solana_rpc_url.get_secret_value()
     check_rpc_url(rpc_url)
-    rpc = SolanaRpcClient(rpc_url, commitment=settings.commitment)
+    check_ws_url(settings.solana_ws_url.get_secret_value())
+    rpc = SolanaRpcClient(rpc_url, commitment=settings.commitment, max_rps=settings.rpc_max_rps)
     migrations = PumpMigrationSource(
         rpc, clock=clock, migration_account=settings.pump_migration_account, budget_s=settings.ingest_budget_s
     )
@@ -47,6 +57,7 @@ def build_live_sources(settings: Settings, uow: UnitOfWorkFactory, clock: Clock)
         concentration_refresh_s=settings.concentration_refresh_s,
         poll_budget_s=settings.poll_budget_s,
         concurrency=settings.rpc_concurrency,
+        bulk=settings.rpc_bulk_history,
     )
     jupiter = JupiterClient(
         settings.jupiter_base_url, settings.jupiter_api_key.get_secret_value(), max_rps=settings.jupiter_max_rps

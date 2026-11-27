@@ -45,6 +45,17 @@ def test_rpc_url_guard_rejects_the_example_value_and_warns_about_the_public_endp
     assert "SECRET123" not in "".join(messages)
 
 
+def test_websocket_url_left_with_the_placeholder_fails_at_startup():
+    import pytest
+
+    from app.infrastructure.live import check_ws_url
+
+    with pytest.raises(RuntimeError, match="SOLANA_WS_URL"):
+        check_ws_url("wss://TU-PROVEEDOR-RPC/PEGA-ACA-TU-URL-WSS")
+    check_ws_url("")  # vacía es válida: solo reconciliación por RPC
+    check_ws_url("wss://mainnet.helius-rpc.com/?api-key=clave-de-prueba")
+
+
 def test_explicit_path_overrides_the_default_file():
     cfg = load_strategy(settings(data_mode="live", strategy_config_path=DEFAULT_FIXTURE_STRATEGY))
     assert cfg.name == "fixtures-v1"

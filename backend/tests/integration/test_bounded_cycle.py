@@ -133,6 +133,60 @@ class TestHeartbeat:
         assert any("tardó" in r.message and "fuente lenta" in r.message for r in caplog.records)
 
 
+def run_replay(skip_terminal: bool):
+    """Reproduce todos los escenarios en una base propia y devuelve lo que se decidió y qué pools se consultaron."""
+    from app.domain.strategy import TERMINAL_CODES
+    from app.infrastructure.db import make_engine, make_session_factory, uow_factory
+    from app.infrastructure.orm import Base
+
+    engine = make_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    factory = make_session_factory(engine)
+    h = Harness(uow_factory(factory))
+    h.worker.skip_terminal_pools = skip_terminal
+    polled: list[tuple[int, str]] = []
+    inner = h.market._inner
+    real = inner.get_snapshots
+
+    def spy(pool, now):
+        polled.append((len(h.reports), pool.address))
+        return real(pool, now)
+
+    inner.get_snapshots = spy  # type: ignore[method-assign]
+    h.run_all()
+    terminal = {c.value for c in TERMINAL_CODES}
+    with factory() as s:
+        positions = sorted(
+            (p.session_id, p.pool, p.status, p.reject_reason, p.debited_lamports, p.proceeds_lamports, p.exit_trigger, p.illiquid)
+            for p in s.scalars(select(orm.PaperPosition))
+        )
+        signals = sorted((x.pool, x.issued_at) for x in s.scalars(select(orm.Signal)))
+        last: dict[str, orm.Evaluation] = {}
+        for ev in s.scalars(select(orm.Evaluation).order_by(orm.Evaluation.window_index)):
+            last[ev.pool] = ev
+        statuses = {pool: ev.status for pool, ev in last.items()}
+        dropped = {pool for pool, ev in last.items() if terminal & {r["code"] for r in ev.reasons}}
+        evaluations = len(s.scalars(select(orm.Evaluation)).all())
+    engine.dispose()
+    return {"positions": positions, "signals": signals, "statuses": statuses, "dropped": dropped,
+            "polled": [p for _, p in polled], "evaluations": evaluations}  # fmt: skip
+
+
+def test_skipping_definitively_discarded_pools_changes_no_decision():
+    full, lean = run_replay(False), run_replay(True)
+    # contrato: mismas señales, mismas posiciones (montos incluidos) y mismo estado final de cada pool
+    assert lean["signals"] == full["signals"] and full["signals"]
+    assert lean["positions"] == full["positions"] and full["positions"]
+    assert lean["statuses"] == full["statuses"]
+    # pero se consulta menos al proveedor, justamente por los pools descartados para siempre
+    assert full["dropped"] and len(lean["polled"]) < len(full["polled"])
+    watched = {p[1] for p in full["positions"] if p[2] == "open"}
+    for pool in full["dropped"] - watched:
+        assert lean["polled"].count(pool) <= full["polled"].count(pool)
+    for pool in watched:  # con una posición abierta se sigue consultando siempre
+        assert lean["polled"].count(pool) == full["polled"].count(pool)
+
+
 def test_fixtures_replay_is_unchanged_by_the_new_budget_parameters(uow, session_factory):
     """Contrato: sin presupuesto el resultado es el de siempre (la reproducción es determinista)."""
     h = Harness(uow)

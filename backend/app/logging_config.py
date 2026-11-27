@@ -19,17 +19,20 @@ def redact(text: str) -> str:
     return text
 
 
-class RedactingFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact(str(record.getMessage()))
-        record.args = ()
-        return True
+class RedactingFormatter(logging.Formatter):
+    """Redacta la línea ya formada: mensaje **y** traceback.
+
+    Filtrar solo ``record.msg`` dejaba pasar sin redactar el texto de las excepciones (``log.exception``), que puede
+    incluir la URL del RPC con su clave.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
 
 
 def configure_logging(level: str = "INFO") -> None:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    handler.addFilter(RedactingFilter())
+    handler.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level.upper())

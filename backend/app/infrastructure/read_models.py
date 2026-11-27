@@ -19,7 +19,7 @@ from app.domain.config import StrategyConfig
 from app.domain.metrics import ClosedTrade, OpenTrade, compute_metrics
 from app.domain.reasons import CandidateStatus, PositionStatus
 from app.infrastructure import orm
-from app.infrastructure.repositories import AuditRepo, CheckpointRepo, SessionRepo
+from app.infrastructure.repositories import AuditRepo, CheckpointRepo, EvaluationRepo, SessionRepo
 
 
 # ------------------------------------------------------------------ utilidades
@@ -639,9 +639,11 @@ def ops(s: Session, as_of: datetime) -> dict[str, Any]:
     stale_pools = 0
     if cfg:
         active_cut = as_of.timestamp() - cfg.max_age_after_migration_s
+        # los descartados en forma definitiva dejan de consultarse a propósito: no cuentan como datos vencidos
+        dropped = EvaluationRepo(s).terminal_pools(version.id, [pool for pool, _ in latest_end])
         for pool, end in latest_end:
             migrated = s.get(orm.Pool, pool).migrated_at.timestamp()
-            if migrated >= active_cut and stale_cut - end.timestamp() > cfg.data_max_age_s:
+            if pool not in dropped and migrated >= active_cut and stale_cut - end.timestamp() > cfg.data_max_age_s:
                 stale_pools += 1
     jobs_by_status = dict(s.execute(select(orm.Job.status, func.count()).group_by(orm.Job.status)).all())
     retried = s.scalar(select(func.count()).select_from(orm.Job).where(orm.Job.attempts > 1)) or 0

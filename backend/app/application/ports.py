@@ -147,6 +147,7 @@ class StrategyRepository(Protocol):
 
 class EvaluationRepository(Protocol):
     def exists(self, pool: str, window_index: int, version_id: int) -> bool: ...
+    def terminal_pools(self, version_id: int, pools: Sequence[str]) -> set[str]: ...
     def save(
         self,
         *,

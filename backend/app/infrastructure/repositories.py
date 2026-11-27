@@ -34,8 +34,9 @@ from app.domain.models import (
     SignalInfo,
 )
 from app.domain.reasons import AttemptStatus, LedgerKind, PositionStatus, SignalStatus
-from app.domain.strategy import EvaluationResult
+from app.domain.strategy import TERMINAL_CODES, EvaluationResult
 from app.infrastructure import orm
+from app.logging_config import redact
 
 
 def insert_ignore(session: Session, model: Any, values: dict[str, Any], pk: Any) -> Any | None:
@@ -244,7 +245,7 @@ class CheckpointRepo:
     def mark_failure(self, source: str, stream: str, now: datetime, error: str) -> None:
         row = self._ensure(source, stream, now)
         row.consecutive_failures += 1
-        row.last_error = error[:500]
+        row.last_error = redact(error)[:500]  # se muestra en /api/v1/status: nunca con claves
         row.updated_at = now
 
     def list_all(self) -> list[Checkpoint]:
@@ -444,6 +445,24 @@ class StrategyRepo:
 class EvaluationRepo:
     def __init__(self, s: Session) -> None:
         self.s = s
+
+    def terminal_pools(self, version_id: int, pools: Sequence[str]) -> set[str]:
+        """Pools cuya última evaluación en esta versión tiene un motivo definitivo (ver ``TERMINAL_CODES``)."""
+        if not pools:
+            return set()
+        latest = (
+            select(orm.Evaluation.pool, func.max(orm.Evaluation.window_index).label("last_window"))
+            .where(orm.Evaluation.strategy_version_id == version_id, orm.Evaluation.pool.in_(list(pools)))
+            .group_by(orm.Evaluation.pool)
+            .subquery()
+        )
+        rows = self.s.execute(
+            select(orm.Evaluation.pool, orm.Evaluation.reasons)
+            .join(latest, (orm.Evaluation.pool == latest.c.pool) & (orm.Evaluation.window_index == latest.c.last_window))
+            .where(orm.Evaluation.strategy_version_id == version_id)
+        )
+        terminal = {c.value for c in TERMINAL_CODES}
+        return {pool for pool, reasons in rows if terminal & {r.get("code") for r in reasons or []}}
 
     def exists(self, pool: str, window_index: int, version_id: int) -> bool:
         return (
@@ -906,7 +925,7 @@ class JobRepo:
         """Reintenta con espera creciente; tras agotar intentos (o error permanente) queda ``dead``."""
         row = self.s.get(orm.Job, job_id)
         assert row is not None
-        row.last_error = error[:1000]
+        row.last_error = redact(error)[:1000]
         row.claim_expires_at = None
         row.updated_at = now
         if permanent or row.attempts >= row.max_attempts:
