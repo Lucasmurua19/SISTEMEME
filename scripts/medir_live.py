@@ -49,8 +49,26 @@ with ultima as (
 ), conc as (
   select distinct on (pool) pool, top10_concentration_pct as v from market_snapshots
   where top10_concentration_pct is not null order by pool, window_index desc
+), entradas as (
+  -- una fila por cotización de entrada: las compartidas por las dos sesiones cuentan una vez
+  select distinct on (quote_id) detail::jsonb -> 'timing' as t,
+         jsonb_array_length(detail::jsonb -> 'shared_quote_with') > 0 as compartida
+  from paper_attempts where kind = 'entry' and detail::jsonb -> 'timing' is not null order by quote_id, id
+), tramos as (
+  select extract(epoch from (t->>'due_at')::timestamptz - (t->>'signal_at')::timestamptz)::double precision as turno,
+         extract(epoch from (t->>'requested_at')::timestamptz - (t->>'due_at')::timestamptz)::double precision as pedido,
+         extract(epoch from (t->>'received_at')::timestamptz - (t->>'requested_at')::timestamptz)::double precision as respuesta,
+         compartida
+  from entradas
 )
 select json_build_object(
+ 'demoras_entrada', (select json_build_object('cotizaciones', count(*), 'compartidas', count(*) filter (where compartida),
+   'senal_a_turno', json_build_array(round(percentile_cont(0.5) within group (order by turno)::numeric,1),
+     round(percentile_cont(0.9) within group (order by turno)::numeric,1)),
+   'turno_a_pedido', json_build_array(round(percentile_cont(0.5) within group (order by pedido)::numeric,1),
+     round(percentile_cont(0.9) within group (order by pedido)::numeric,1)),
+   'pedido_a_respuesta', json_build_array(round(percentile_cont(0.5) within group (order by respuesta)::numeric,1),
+     round(percentile_cont(0.9) within group (order by respuesta)::numeric,1))) from tramos),
  'minutos', (select round((extract(epoch from now() - min(started_at))/60)::numeric, 1) from paper_sessions),
  'migraciones', (select count(*) from chain_events),
  'latencia', (select json_build_object('mediana', round(percentile_cont(0.5) within group (order by s)::numeric,1),
@@ -234,6 +252,26 @@ def report(s: dict, metrics: dict | None, samples: list[dict]) -> str:
         ]
     else:
         out.append("La API no respondió: sin métricas de las sesiones.")
+    delays = b.get("demoras_entrada") or {}
+    if delays.get("cotizaciones"):
+        out += [
+            "",
+            "## 5. Demora de las entradas",
+            "",
+            f"{delays['cotizaciones']} cotizaciones de entrada, {delays['compartidas']} compartidas por las dos sesiones. "
+            "El primer tramo incluye el retraso de entrada configurado.",
+            "",
+            "| Tramo | Mediana | p90 |",
+            "|---|---:|---:|",
+        ]
+        out += [
+            f"| {label} | {delays[key][0]} s | {delays[key][1]} s |"
+            for label, key in (
+                ("Señal → turno de cotizar", "senal_a_turno"),
+                ("Turno → pedido de la cotización", "turno_a_pedido"),
+                ("Pedido → cotización recibida", "pedido_a_respuesta"),
+            )
+        ]
     if samples:
         out += ["", "## Evolución", "", "```"] + [line(x) for x in samples] + ["```"]
     out += [

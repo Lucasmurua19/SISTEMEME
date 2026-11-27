@@ -7,6 +7,7 @@ Invariantes:
   intento no duplica capital.
 - Las llamadas de red (cotizaciones, FX) se hacen fuera de las transacciones y la vigencia se
   revalida al escribir.
+- Las sesiones que admiten la misma señal en el mismo ciclo entran con la misma cotización.
 - Una venta fallida deja la posición abierta, actualiza su valoración y habilita un reintento tras una espera
   creciente. Cada intento se compara con la cotización tomada al programarlo, nunca con la de un intento anterior.
 """
@@ -26,11 +27,20 @@ from app.application.ports import (
     FxRate,
     QuoteProvider,
     TransientSourceError,
+    UnitOfWork,
     UnitOfWorkFactory,
 )
 from app.domain.config import StrategyConfig
 from app.domain.costs import adverse_exit_proceeds, net_exit_proceeds
-from app.domain.models import LAMPORTS_PER_SOL, PoolInfo, Quote
+from app.domain.models import (
+    LAMPORTS_PER_SOL,
+    AttemptInfo,
+    MarketSnapshot,
+    PoolInfo,
+    PositionInfo,
+    Quote,
+    SignalInfo,
+)
 from app.domain.reasons import (
     AttemptKind,
     AttemptStatus,
@@ -40,6 +50,7 @@ from app.domain.reasons import (
 )
 from app.domain.risk import RiskLimits, check_entry
 from app.domain.simulation import (
+    EntryDecision,
     ExitSignal,
     check_exit_trigger,
     decide_entry,
@@ -100,13 +111,16 @@ def admit_signals(
     session_id: int,
     cfg: StrategyConfig,
     blocked_sources: frozenset[str] = frozenset(),
+    at: datetime | None = None,
 ) -> list[AdmissionOutcome]:
     """Procesa las señales vigentes que la sesión todavía no vio.
 
     El orden depende de la política: ``ranking`` (puntaje) o ``liquidity`` (referencia simple). Las
-    dos sesiones ven el mismo universo elegible en el mismo instante, con idénticos límites.
+    dos sesiones ven el mismo universo elegible en el mismo instante, con idénticos límites. ``at`` es el
+    instante del ciclo: con el mismo valor, las entradas de ambas sesiones quedan programadas a la vez y
+    comparten la cotización.
     """
-    now = clock.now()
+    now = at or clock.now()
     outcomes: list[AdmissionOutcome] = []
     with uow_factory() as uow:
         sess = uow.sessions.lock(session_id)  # serializa las reservas de esta sesión
@@ -189,7 +203,15 @@ def execute_entry(
     cfg_loader: ConfigLoader,
     attempt_id: int,
 ) -> str:
-    """Ejecuta el intento de entrada tras el retraso simulado, con cotizaciones nuevas."""
+    """Ejecuta el intento de entrada tras el retraso simulado, con cotizaciones nuevas.
+
+    Los intentos de la misma señal programados para el mismo instante (uno por sesión) se resuelven juntos: una sola
+    cotización, un solo momento de decisión y una sola transacción. Así una diferencia entre sesiones no puede deberse
+    a que una haya entrado más tarde. El trabajo de los demás intentos ya no encuentra nada pendiente.
+
+    Cada intento guarda en ``detail["timing"]`` cuándo apareció la señal, cuándo tocaba cotizar, cuándo se pidió la
+    cotización y cuándo llegó.
+    """
     now = clock.now()
     with uow_factory() as uow:
         att = uow.attempts.get(attempt_id)
@@ -207,106 +229,150 @@ def execute_entry(
         latest = snaps[-1] if snaps else None
     cfg = cfg_loader(sig.strategy_version_id)
 
+    requested_at = clock.now()
     buy = _safe_buy(quotes, pool, sig.amount_lamports, cfg.slippage_bps, now)  # red
     sell = _safe_sell(quotes, pool, buy.min_out_amount, cfg.slippage_bps, now) if buy.ok else None  # red
+    received_at = clock.now()
     fx_rate = _safe_fx(fx, now)  # red
     decided_at = clock.now()
     decision = decide_entry(signal=sig, buy=buy, sell=sell, latest=latest, now=decided_at, cfg=cfg)
+    timing = {
+        "signal_at": sig.issued_at.isoformat(),
+        "due_at": att.scheduled_at.isoformat(),
+        "requested_at": requested_at.isoformat(),
+        "received_at": received_at.isoformat(),
+    }
 
     with uow_factory() as uow:
-        uow.sessions.lock(pos.session_id)
-        att = uow.attempts.get(attempt_id, lock=True)
-        position = uow.positions.get(pos.id, lock=True)
-        if att is None or att.status != AttemptStatus.PENDING.value or position is None:
+        batch = uow.attempts.entry_batch(sig.id, att.scheduled_at)
+        for session_id, _ in batch:  # vienen ordenadas por sesión: dos workers bloquean en el mismo orden
+            uow.sessions.lock(session_id)
+        ready: list[tuple[AttemptInfo, PositionInfo]] = []
+        for _, batch_id in batch:
+            item = uow.attempts.get(batch_id, lock=True)
+            if item is None or item.status != AttemptStatus.PENDING.value:
+                continue
+            position = uow.positions.get(item.position_id, lock=True)
+            if position is not None and position.status == PositionStatus.PENDING_ENTRY.value:
+                ready.append((item, position))
+        if all(item.id != attempt_id for item, _ in ready):
             return "noop"
-        if position.status != PositionStatus.PENDING_ENTRY.value:
-            return "noop"
-        session = uow.sessions.get(position.session_id)
-        assert session is not None
 
         buy_id = uow.quotes.save(buy, pool=pool.address, purpose="entry")
         sell_id = uow.quotes.save(sell, pool=pool.address, purpose="entry") if sell else None
         if fx_rate:
             uow.quotes.save_fx(fx_rate)
 
-        accepted = decision.accepted
-        code = decision.code
-        message = decision.message
-        detail = dict(decision.detail)
-        reserved = position.reserved_lamports
-
-        # La reserva se libera siempre: o se convierte en débito real, o se devuelve.
-        uow.ledger.add(
-            session_id=session.id, position_id=position.id, attempt_id=att.id,
-            kind=LedgerKind.RELEASE, amount=reserved, now=decided_at,
-        )  # fmt: skip
-
-        if accepted and session.paused:
-            accepted, code, message = False, ReasonCode.SESSION_PAUSED, "la sesión se pausó antes de la entrada"
-        rt = decision.round_trip
-        if accepted:
-            assert rt is not None
-            if uow.sessions.state(session.id).available_lamports < rt.total_debited_lamports:
-                accepted, code, message = False, ReasonCode.INSUFFICIENT_CAPITAL, "capital insuficiente tras revalidar"
-
-        if accepted:
-            assert rt is not None and sell is not None
-            uow.ledger.add(
-                session_id=session.id, position_id=position.id, attempt_id=att.id,
-                kind=LedgerKind.DEBIT, amount=rt.total_debited_lamports, now=decided_at,
+        results: dict[int, str] = {}
+        for item, position in ready:
+            shared = [other.id for other, _ in ready if other.id != item.id]
+            results[item.id] = _apply_entry(
+                uow, attempt=item, position=position, signal=sig, pool=pool, latest=latest, cfg=cfg,
+                decision=decision, buy=buy, sell=sell, buy_id=buy_id, sell_id=sell_id, fx_rate=fx_rate,
+                decided_at=decided_at, trace={"timing": timing, "shared_quote_with": shared},
             )  # fmt: skip
-            immobilized = rt.immobilized_lamports if cfg.ata_deposit_refundable else 0
-            uow.positions.update(
-                position.id,
-                decided_at,
-                status=PositionStatus.OPEN.value,
-                tokens_expected=rt.tokens_expected,
-                tokens_min=rt.tokens_min,
-                debited_lamports=rt.total_debited_lamports,
-                reserved_lamports=0,
-                immobilized_lamports=immobilized,
-                entry_price=_entry_price(buy.in_amount, buy.out_amount, pool.decimals),
-                entry_liquidity_lamports=latest.liquidity_lamports if latest else None,
-                opened_at=decided_at,
-                last_recoverable_lamports=net_exit_proceeds(sell) + immobilized,
-                last_recoverable_adverse_lamports=adverse_exit_proceeds(sell) + immobilized,
-                last_valued_at=decided_at,
-                valuation_status="ok",
-                sol_usd_open=fx_rate.rate if fx_rate else None,
-            )
-            uow.attempts.finish(
-                att.id,
-                status=AttemptStatus.APPLIED,
-                executed_at=decided_at,
-                quote_id=buy_id,
-                requested_amount=buy.in_amount,
-                result_amount=rt.tokens_expected,
-                detail={"sell_quote_id": sell_id, "round_trip": rt.to_dict(), "message": message},
-            )
-            uow.audit.log("paper_position", str(position.id), "opened", PositionStatus.PENDING_ENTRY.value,
-                          PositionStatus.OPEN.value, {"cost_pct": str(rt.cost_pct)}, decided_at)  # fmt: skip
-            return "opened"
+        return results[attempt_id]
 
+
+def _apply_entry(
+    uow: UnitOfWork,
+    *,
+    attempt: AttemptInfo,
+    position: PositionInfo,
+    signal: SignalInfo,
+    pool: PoolInfo,
+    latest: MarketSnapshot | None,
+    cfg: StrategyConfig,
+    decision: EntryDecision,
+    buy: Quote,
+    sell: Quote | None,
+    buy_id: int,
+    sell_id: int | None,
+    fx_rate: FxRate | None,
+    decided_at: datetime,
+    trace: dict,
+) -> str:
+    """Aplica una decisión de entrada a la posición de una sesión (pausa y capital se revisan por sesión)."""
+    session = uow.sessions.get(position.session_id)
+    assert session is not None
+    accepted = decision.accepted
+    code = decision.code
+    message = decision.message
+    detail = dict(decision.detail)
+    reserved = position.reserved_lamports
+
+    # La reserva se libera siempre: o se convierte en débito real, o se devuelve.
+    uow.ledger.add(
+        session_id=session.id, position_id=position.id, attempt_id=attempt.id,
+        kind=LedgerKind.RELEASE, amount=reserved, now=decided_at,
+    )  # fmt: skip
+
+    if accepted and session.paused:
+        accepted, code, message = False, ReasonCode.SESSION_PAUSED, "la sesión se pausó antes de la entrada"
+    rt = decision.round_trip
+    if accepted:
+        assert rt is not None
+        if uow.sessions.state(session.id).available_lamports < rt.total_debited_lamports:
+            accepted, code, message = False, ReasonCode.INSUFFICIENT_CAPITAL, "capital insuficiente tras revalidar"
+
+    if accepted:
+        assert rt is not None and sell is not None
+        uow.ledger.add(
+            session_id=session.id, position_id=position.id, attempt_id=attempt.id,
+            kind=LedgerKind.DEBIT, amount=rt.total_debited_lamports, now=decided_at,
+        )  # fmt: skip
+        immobilized = rt.immobilized_lamports if cfg.ata_deposit_refundable else 0
         uow.positions.update(
             position.id,
             decided_at,
-            status=PositionStatus.REJECTED.value,
+            status=PositionStatus.OPEN.value,
+            tokens_expected=rt.tokens_expected,
+            tokens_min=rt.tokens_min,
+            debited_lamports=rt.total_debited_lamports,
             reserved_lamports=0,
-            reject_reason=code.value if code else None,
-            reject_detail={"message": message, **detail},
+            immobilized_lamports=immobilized,
+            entry_price=_entry_price(buy.in_amount, buy.out_amount, pool.decimals),
+            entry_liquidity_lamports=latest.liquidity_lamports if latest else None,
+            opened_at=decided_at,
+            last_recoverable_lamports=net_exit_proceeds(sell) + immobilized,
+            last_recoverable_adverse_lamports=adverse_exit_proceeds(sell) + immobilized,
+            last_valued_at=decided_at,
+            valuation_status="ok",
+            sol_usd_open=fx_rate.rate if fx_rate else None,
         )
         uow.attempts.finish(
-            att.id,
-            status=AttemptStatus.REJECTED,
+            attempt.id,
+            status=AttemptStatus.APPLIED,
             executed_at=decided_at,
             quote_id=buy_id,
-            requested_amount=buy.in_amount or sig.amount_lamports,
-            failure_cause=code.value if code else None,
-            detail={"sell_quote_id": sell_id, "message": message, **detail},
+            requested_amount=buy.in_amount,
+            result_amount=rt.tokens_expected,
+            detail={"sell_quote_id": sell_id, "round_trip": rt.to_dict(), "message": message, **trace},
         )
-        uow.audit.log("paper_position", str(position.id), "entry_rejected", PositionStatus.PENDING_ENTRY.value,
-                      PositionStatus.REJECTED.value, {"code": code.value if code else None}, decided_at)  # fmt: skip
-        return f"rejected:{code.value if code else 'unknown'}"
+        uow.audit.log("paper_position", str(position.id), "opened", PositionStatus.PENDING_ENTRY.value,
+                      PositionStatus.OPEN.value, {"cost_pct": str(rt.cost_pct)}, decided_at)  # fmt: skip
+        return "opened"
+
+    uow.positions.update(
+        position.id,
+        decided_at,
+        status=PositionStatus.REJECTED.value,
+        reserved_lamports=0,
+        reject_reason=code.value if code else None,
+        reject_detail={"message": message, **detail},
+    )
+    uow.attempts.finish(
+        attempt.id,
+        status=AttemptStatus.REJECTED,
+        executed_at=decided_at,
+        quote_id=buy_id,
+        requested_amount=buy.in_amount or signal.amount_lamports,
+        failure_cause=code.value if code else None,
+        detail={"sell_quote_id": sell_id, "message": message, **detail, **trace},
+    )
+    uow.audit.log("paper_position", str(position.id), "entry_rejected", PositionStatus.PENDING_ENTRY.value,
+                  PositionStatus.REJECTED.value, {"code": code.value if code else None}, decided_at)  # fmt: skip
+    return f"rejected:{code.value if code else 'unknown'}"
 
 
 # --------------------------------------------------------------------------- monitoreo y salida

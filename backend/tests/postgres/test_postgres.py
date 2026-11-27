@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import importlib.util
 import threading
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from alembic import command
 from sqlalchemy import func, inspect, select, text
 
 from app.application.evaluate_pool import evaluate_pools
-from app.application.process_position import admit_signals
+from app.application.process_position import admit_signals, execute_entry
 from app.infrastructure import orm
 from tests.harness import Harness
 from tests.integration.test_replay_pipeline import positions_by_session
@@ -97,6 +100,61 @@ def test_two_workers_never_open_the_same_signal_twice(pg_uow, pg_sessions):
     assert len(positions) == 3  # una por señal, aunque cuatro workers compitieron
     assert sorted(p.status for p in positions) == ["pending_entry", "pending_entry", "rejected"]
     assert len(reserves) == 2 and sum(r.amount_lamports for r in reserves) == 200_000_000
+
+
+def test_two_workers_executing_sibling_entries_apply_each_one_once(pg_uow, pg_sessions):
+    """Cada worker toma el intento de una sesión: una sola cotización se aplica a las dos, sin duplicar capital."""
+    h = Harness(pg_uow, only={"alpha_valid"})
+    assert any(h.run(15)[0].admitted == 2 for _ in range(80))
+    h.clock.advance(5)
+    with pg_sessions() as s:
+        attempt_ids = list(s.scalars(select(orm.PaperAttempt.id).where(orm.PaperAttempt.kind == "entry")))
+    assert len(attempt_ids) == 2
+
+    errors: list[BaseException] = []
+    results: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def worker(attempt_id: int):
+        try:
+            barrier.wait(timeout=10)
+            results.append(execute_entry(
+                uow_factory=pg_uow, quotes=h.worker.quotes, fx=None, clock=h.clock,
+                cfg_loader=h.worker.cfg_for, attempt_id=attempt_id,
+            ))  # fmt: skip
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in attempt_ids]
+    [t.start() for t in threads]
+    [t.join(30) for t in threads]
+    assert errors == [] and sorted(results) == ["noop", "opened"]
+
+    with pg_sessions() as s:
+        attempts = list(s.scalars(select(orm.PaperAttempt).where(orm.PaperAttempt.id.in_(attempt_ids))))
+        ledger = list(s.scalars(select(orm.PaperLedger)))
+    assert {a.status for a in attempts} == {"applied"} and len({a.quote_id for a in attempts}) == 1
+    assert sorted(r.kind for r in ledger) == ["debit", "debit", "release", "release", "reserve", "reserve"]
+
+
+def test_measurement_script_reports_where_the_entry_delay_goes(pg_uow, pg_engine):
+    """La consulta de ``scripts/medir_live.py`` corre sobre PostgreSQL y desglosa la demora de las entradas."""
+    path = Path(__file__).resolve().parents[3] / "scripts" / "medir_live.py"
+    spec = importlib.util.spec_from_file_location("medir_live", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    h = Harness(pg_uow, only={"alpha_valid"})
+    h.run_all()
+
+    with pg_engine.connect() as conn:
+        data = conn.exec_driver_sql(script.SQL).scalar_one()
+    delays = data["demoras_entrada"]
+    assert delays["cotizaciones"] == 1 and delays["compartidas"] == 1
+    assert delays["senal_a_turno"] == [h.cfg.entry_delay_s] * 2
+    # el arnés avanza de a 15 s: el worker llega 10 s después del turno y las cotizaciones de fixtures no tardan
+    assert delays["turno_a_pedido"] == [10, 10] and delays["pedido_a_respuesta"] == [0, 0]
+    report = script.report({"hora": "x", "base": data, "log": defaultdict(int)}, None, [])
+    assert "## 5. Demora de las entradas" in report and "| Turno → pedido de la cotización | 10.0 s | 10.0 s |" in report
 
 
 def test_job_claim_skips_locked_rows_across_connections(pg_uow, pg_sessions):

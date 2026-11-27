@@ -198,11 +198,13 @@ class Worker:
         blocked = self._blocked_sources(now)
         with self.uow() as uow:
             sessions = uow.sessions.list_for_version(self.version_id)
+        admitted_at = self.clock.now()  # un solo instante: las entradas de ambas sesiones se programan a la vez
         for sess in sessions:
             admitted = self._guard(
                 rep, f"admit[{sess.policy}]",
                 lambda sess=sess: admit_signals(
-                    uow_factory=self.uow, clock=self.clock, session_id=sess.id, cfg=self.cfg, blocked_sources=blocked
+                    uow_factory=self.uow, clock=self.clock, session_id=sess.id, cfg=self.cfg, blocked_sources=blocked,
+                    at=admitted_at,
                 ),
             )  # fmt: skip
             for a in admitted or []:

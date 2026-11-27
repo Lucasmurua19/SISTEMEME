@@ -33,7 +33,7 @@ from app.domain.models import (
     SessionState,
     SignalInfo,
 )
-from app.domain.reasons import AttemptStatus, LedgerKind, PositionStatus, SignalStatus
+from app.domain.reasons import AttemptKind, AttemptStatus, LedgerKind, PositionStatus, SignalStatus
 from app.domain.strategy import TERMINAL_CODES, EvaluationResult
 from app.infrastructure import orm
 from app.logging_config import redact
@@ -786,6 +786,20 @@ class AttemptRepo:
             stmt = stmt.with_for_update()
         row = self.s.scalar(stmt)
         return _attempt(row) if row else None
+
+    def entry_batch(self, signal_id: int, scheduled_at: datetime) -> list[tuple[int, int]]:
+        """``(sesión, intento)`` de las entradas pendientes de una señal programadas para ese instante, por sesión."""
+        rows = self.s.execute(
+            select(orm.PaperPosition.session_id, orm.PaperAttempt.id, orm.PaperAttempt.scheduled_at)
+            .join(orm.PaperPosition, orm.PaperPosition.id == orm.PaperAttempt.position_id)
+            .where(
+                orm.PaperPosition.signal_id == signal_id,
+                orm.PaperAttempt.kind == AttemptKind.ENTRY.value,
+                orm.PaperAttempt.status == AttemptStatus.PENDING.value,
+            )
+            .order_by(orm.PaperPosition.session_id)
+        )
+        return [(session_id, attempt_id) for session_id, attempt_id, due in rows if due == scheduled_at]
 
     def finish(
         self,
