@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     fixtures_dir: str = "fixtures/scenarios"
     fixture_step_seconds: int = 15
 
+    # --- destino de las órdenes: hoy solo existe la simulación; "manual" y "auto" se rechazan al arrancar
+    execution_mode: Literal["paper", "manual", "auto"] = "paper"
+
     # --- estrategia
     strategy_config_path: str | None = None
 

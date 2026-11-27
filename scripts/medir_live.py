@@ -60,8 +60,60 @@ with ultima as (
          extract(epoch from (t->>'received_at')::timestamptz - (t->>'requested_at')::timestamptz)::double precision as respuesta,
          compartida
   from entradas
+), decisiones as (
+  -- una fila por señal y sesión, con el ciclo en que se admitió o rechazó
+  select a.detail::jsonb -> 'selection' ->> 'cycle' as ciclo, a.action = 'reserved' as elegida, s.policy,
+         p.signal_id::bigint as senal, left(p.pool, 6) as pool, p.status, p.pnl_lamports
+  from audit_log a
+  join paper_positions p on a.entity = 'paper_position' and a.entity_id = p.id::text
+  join paper_sessions s on s.id = p.session_id
+  where a.action in ('reserved', 'rejected') and a.detail::jsonb -> 'selection' is not null
+), por_sesion as (
+  select ciclo, policy, array_agg(senal order by senal) as candidatas,
+         coalesce(array_agg(senal order by senal) filter (where elegida), array[]::bigint[]) as elegidas
+  from decisiones group by ciclo, policy
+), ciclos as (
+  -- todas las señales piden el mismo monto: con igual cantidad de lugares, elegir distinto solo puede venir del orden
+  select r.ciclo, r.elegidas as de_ranking, l.elegidas as de_liquidez,
+    case when r.candidatas <> l.candidatas then 'distintas_senales'
+         when cardinality(r.elegidas) <> cardinality(l.elegidas) then 'distinta_capacidad'
+         when r.elegidas <> l.elegidas then 'orden'
+         when cardinality(r.elegidas) = 0 then 'sin_lugar'
+         when cardinality(r.elegidas) < cardinality(r.candidatas) then 'misma_eleccion_con_competencia'
+         else 'sin_competencia' end as tipo
+  from por_sesion r join por_sesion l on l.ciclo = r.ciclo and l.policy = 'liquidity' where r.policy = 'ranking'
+), ventas as (
+  select jsonb_array_length(detail::jsonb -> 'shared_quote_with') > 0 as compartida,
+         detail::jsonb ->> 'separate_quote_reason' as motivo
+  from paper_attempts where kind = 'exit' and detail::jsonb -> 'shared_quote_with' is not null
+), parejas as (
+  select r.status = 'closed' and l.status = 'closed' as cerradas, r.pnl_lamports = l.pnl_lamports as igual
+  from paper_positions r
+  join paper_sessions sr on sr.id = r.session_id and sr.policy = 'ranking'
+  join paper_positions l on l.signal_id = r.signal_id
+  join paper_sessions sl on sl.id = l.session_id and sl.policy = 'liquidity'
+  join paper_attempts a on a.position_id = r.id and a.kind = 'entry'
+  join paper_attempts b on b.position_id = l.id and b.kind = 'entry' and b.quote_id = a.quote_id
+  where r.status in ('open', 'closed') and l.status in ('open', 'closed')
 )
 select json_build_object(
+ 'seleccion', (select json_build_object('ciclos', count(*),
+   'orden', count(*) filter (where tipo = 'orden'),
+   'misma_eleccion_con_competencia', count(*) filter (where tipo = 'misma_eleccion_con_competencia'),
+   'sin_competencia', count(*) filter (where tipo = 'sin_competencia'),
+   'distinta_capacidad', count(*) filter (where tipo = 'distinta_capacidad'),
+   'sin_lugar', count(*) filter (where tipo = 'sin_lugar'),
+   'distintas_senales', count(*) filter (where tipo = 'distintas_senales')) from ciclos),
+ 'casos_orden', (select json_agg(json_build_object('ciclo', c.ciclo, 'sesion', d.policy, 'pool', d.pool,
+     'estado', d.status, 'pnl', d.pnl_lamports) order by c.ciclo, d.policy desc, d.pool)
+   from ciclos c join decisiones d on d.ciclo = c.ciclo and d.elegida
+     and d.senal <> all(case when d.policy = 'ranking' then c.de_liquidez else c.de_ranking end)
+   where c.tipo = 'orden'),
+ 'parejas', (select json_build_object('misma_entrada', count(*), 'cerradas', count(*) filter (where cerradas),
+   'mismo_pnl', count(*) filter (where cerradas and igual)) from parejas),
+ 'salidas', (select json_build_object('intentos', count(*), 'compartidos', count(*) filter (where compartida),
+   'solos', (select json_object_agg(motivo, n) from
+     (select motivo, count(*) as n from ventas where motivo is not null group by motivo) m)) from ventas),
  'demoras_entrada', (select json_build_object('cotizaciones', count(*), 'compartidas', count(*) filter (where compartida),
    'senal_a_turno', json_build_array(round(percentile_cont(0.5) within group (order by turno)::numeric,1),
      round(percentile_cont(0.9) within group (order by turno)::numeric,1)),
@@ -180,6 +232,72 @@ def sol(value: str | None) -> str:
     return "—" if value is None else f"{int(value) / 1e9:+.4f} SOL"
 
 
+SELECTION_KINDS = (
+    ("El orden cambió qué se eligió", "orden"),
+    ("Menos lugares que señales, misma elección", "misma_eleccion_con_competencia"),
+    ("Había lugar para todas", "sin_competencia"),
+    ("Cada sesión tenía distinta cantidad de lugares", "distinta_capacidad"),
+    ("Ninguna tenía lugar", "sin_lugar"),
+    ("Las sesiones no vieron las mismas señales", "distintas_senales"),
+)
+SEPARATE_REASONS = {
+    "sin_otra_posicion": "la otra sesión no tenía esa posición",
+    "cantidad_distinta": "cantidad de tokens distinta",
+    "la_otra_ya_vendio": "la otra ya había vendido",
+    "la_otra_no_vende_en_este_ciclo": "la otra no vendía en ese ciclo (regla propia)",
+    "turno_distinto": "la otra tenía otro turno",
+    "tolerancia_distinta": "tolerancia distinta",
+}
+RESULTS = {"rejected": "entrada rechazada", "pending_entry": "entrada pendiente", "open": "abierta"}
+
+
+def selection_section(b: dict) -> list[str]:
+    """Cuándo el orden de selección hizo que las sesiones eligieran distinto: lo que mide qué aporta el Ranking."""
+    summary = b.get("seleccion") or {}
+    if not summary.get("ciclos"):
+        return []
+    changed = summary["orden"]
+    out = ["", "## 6. ¿El orden de selección cambió la decisión?", ""]
+    if changed:
+        noun = "ciclo" if changed == 1 else "ciclos"
+        out.append(f"**El orden de selección cambió la decisión en {changed} {noun}** de {summary['ciclos']}.")
+    else:
+        out.append(
+            f"**Todavía no hay casos para medir qué aporta el Ranking:** en ninguno de los {summary['ciclos']} ciclos "
+            "el orden cambió qué se eligió."
+        )
+    out += ["", "| Ciclo con señales | Cantidad |", "|---|---:|"]
+    out += [f"| {label} | {summary[key]} |" for label, key in SELECTION_KINDS]
+    cases = b.get("casos_orden") or []
+    if cases:
+        out += ["", "Lo que eligió una sesión y la otra no:", "", "| Ciclo (UTC) | Sesión | Pool | Resultado |", "|---|---|---|---|"]
+        for c in cases:
+            name = "Ranking" if c["sesion"] == "ranking" else "Liquidez"
+            result = RESULTS.get(c["estado"]) or sol(str(int(c["pnl"])))
+            out.append(f"| {c['ciclo'][:19]} | {name} | {c['pool']} | {result} |")
+    return out
+
+
+def execution_section(b: dict) -> list[str]:
+    """Control de la ejecución compartida entre sesiones."""
+    pairs, exits = b.get("parejas") or {}, b.get("salidas") or {}
+    if not pairs.get("misma_entrada") and not exits.get("intentos"):
+        return []
+    out = [
+        "",
+        "## 7. Ejecución compartida",
+        "",
+        f"- Señales en las que ambas entraron con la misma cotización: {pairs.get('misma_entrada', 0)}. "
+        f"De las cerradas en ambas, {pairs.get('mismo_pnl', 0)} de {pairs.get('cerradas', 0)} terminaron con el mismo PnL.",
+        f"- Intentos de salida: {exits.get('intentos', 0)}; con cotización compartida: {exits.get('compartidos', 0)}.",
+    ]
+    out += [
+        f"- Cotizaron solos porque {SEPARATE_REASONS.get(reason, reason)}: {n}."
+        for reason, n in sorted((exits.get("solos") or {}).items(), key=lambda kv: -kv[1])
+    ]
+    return out
+
+
 def report(s: dict, metrics: dict | None, samples: list[dict]) -> str:
     b, g = s["base"], s["log"]
     lat, act, conc = b.get("latencia") or {}, b.get("activos") or {}, b.get("concentracion") or {}
@@ -272,6 +390,7 @@ def report(s: dict, metrics: dict | None, samples: list[dict]) -> str:
                 ("Pedido → cotización recibida", "pedido_a_respuesta"),
             )
         ]
+    out += selection_section(b) + execution_section(b)
     if samples:
         out += ["", "## Evolución", "", "```"] + [line(x) for x in samples] + ["```"]
     out += [

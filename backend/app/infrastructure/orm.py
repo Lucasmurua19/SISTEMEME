@@ -28,6 +28,7 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -409,3 +410,126 @@ class AuditLog(Base):
     from_state: Mapped[str | None] = mapped_column(String(32))
     to_state: Mapped[str | None] = mapped_column(String(32))
     detail: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+
+
+# --------------------------------------------------------------------------- ejecución
+OPEN_ATTEMPT_SQL = "state in ('preparing', 'prepared', 'signed', 'submitted', 'unknown')"
+BLOCKING_SELL_SQL = "side = 'sell' and status in ('active', 'needs_attention')"
+
+
+class ExecutionWallet(Base):
+    """Fila que serializa las reservas de una billetera. Solo guarda su dirección pública, nunca claves."""
+
+    __tablename__ = "execution_wallets"
+    wallet: Mapped[str] = mapped_column(String(64), primary_key=True)
+    buys_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    pause_reason: Mapped[str | None] = mapped_column(String(200))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class ExecutionIntent(Base):
+    __tablename__ = "execution_intents"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_execution_intents_idempotency_key"),
+        Index(
+            "uq_execution_intents_blocking_sell", "position_id", unique=True,
+            postgresql_where=text(BLOCKING_SELL_SQL), sqlite_where=text(BLOCKING_SELL_SQL),
+        ),
+        Index("ix_execution_intents_due", "wallet", "status", "next_attempt_at"),
+    )  # fmt: skip
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    wallet: Mapped[str] = mapped_column(ForeignKey("execution_wallets.wallet"))
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    side: Mapped[str] = mapped_column(String(4))
+    signal_id: Mapped[int] = mapped_column(ForeignKey("signals.id"))
+    position_id: Mapped[int | None] = mapped_column(ForeignKey("live_positions.id"))
+    pool: Mapped[str] = mapped_column(ForeignKey("pools.address"))
+    mint: Mapped[str] = mapped_column(String(64))
+    amount: Mapped[int] = mapped_column(BigInt)  # lamports en una compra, unidades base del token en una venta
+    strategy_version_id: Mapped[int] = mapped_column(ForeignKey("strategy_versions.id"))
+    policy: Mapped[str] = mapped_column(String(16))
+    trigger: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(48))
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    claim_token: Mapped[int] = mapped_column(Integer, default=0)
+    claimed_by: Mapped[str | None] = mapped_column(String(64))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class ExecutionAttempt(Base):
+    __tablename__ = "execution_attempts"
+    __table_args__ = (
+        UniqueConstraint("intent_id", "number", name="uq_execution_attempts_intent_number"),
+        UniqueConstraint("signature", name="uq_execution_attempts_signature"),
+        Index(
+            "uq_execution_attempts_open", "intent_id", unique=True,
+            postgresql_where=text(OPEN_ATTEMPT_SQL), sqlite_where=text(OPEN_ATTEMPT_SQL),
+        ),
+    )  # fmt: skip
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    intent_id: Mapped[int] = mapped_column(ForeignKey("execution_intents.id"))
+    number: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(12))
+    gateway: Mapped[str] = mapped_column(String(16))
+    request_id: Mapped[str | None] = mapped_column(String(100))
+    signature: Mapped[str | None] = mapped_column(String(100))
+    signed_payload: Mapped[str | None] = mapped_column(Text)  # acceso restringido: no exponer por API ni logs
+    valid_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    in_amount: Mapped[int | None] = mapped_column(BigInt)
+    out_amount: Mapped[int | None] = mapped_column(BigInt)
+    min_out_amount: Mapped[int | None] = mapped_column(BigInt)
+    min_out_authorized: Mapped[int | None] = mapped_column(BigInt)  # de la revisión de mercado previa a la orden
+    price_impact_bps: Mapped[Decimal | None] = mapped_column(Price)
+    fee_estimate_lamports: Mapped[int | None] = mapped_column(BigInt)
+    sol_delta_lamports: Mapped[int | None] = mapped_column(BigInt)
+    token_delta: Mapped[int | None] = mapped_column(BigInt)
+    fee_paid_lamports: Mapped[int | None] = mapped_column(BigInt)
+    error: Mapped[str | None] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)  # comienzo de la preparación
+    prepared_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    signed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    submitted_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    resolved_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class LivePosition(Base):
+    __tablename__ = "live_positions"
+    __table_args__ = (UniqueConstraint("buy_intent_id", name="uq_live_positions_buy_intent_id"),)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    wallet: Mapped[str] = mapped_column(ForeignKey("execution_wallets.wallet"), index=True)
+    buy_intent_id: Mapped[int] = mapped_column(PK)  # sin clave foránea: la intención de venta ya apunta a esta tabla
+    signal_id: Mapped[int] = mapped_column(ForeignKey("signals.id"))
+    pool: Mapped[str] = mapped_column(ForeignKey("pools.address"))
+    mint: Mapped[str] = mapped_column(String(64))
+    strategy_version_id: Mapped[int] = mapped_column(ForeignKey("strategy_versions.id"))
+    status: Mapped[str] = mapped_column(String(16))  # open | closed
+    tokens_acquired: Mapped[int] = mapped_column(BigInt)
+    tokens_open: Mapped[int] = mapped_column(BigInt)
+    sol_debited_lamports: Mapped[int] = mapped_column(BigInt)
+    sol_received_lamports: Mapped[int] = mapped_column(BigInt)
+    recoverable_lamports: Mapped[int | None] = mapped_column(BigInt)  # sin valoración = recuperación cero
+    valued_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    pnl_lamports: Mapped[int | None] = mapped_column(BigInt)
+    opened_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class LiveLedger(Base):
+    """Un asiento por movimiento; ``reference`` es única, así que nada confirmado se contabiliza dos veces."""
+
+    __tablename__ = "live_ledger"
+    __table_args__ = (UniqueConstraint("reference", name="uq_live_ledger_reference"),)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    wallet: Mapped[str] = mapped_column(ForeignKey("execution_wallets.wallet"), index=True)
+    intent_id: Mapped[int] = mapped_column(ForeignKey("execution_intents.id"))
+    attempt_id: Mapped[int | None] = mapped_column(ForeignKey("execution_attempts.id"))
+    position_id: Mapped[int | None] = mapped_column(ForeignKey("live_positions.id"))
+    kind: Mapped[str] = mapped_column(String(8))  # reserve | release | debit | credit | fee
+    amount_lamports: Mapped[int] = mapped_column(BigInt)
+    reference: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime)

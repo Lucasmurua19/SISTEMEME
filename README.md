@@ -2,7 +2,7 @@
 
 Detecta migraciones de **Pump.fun → PumpSwap**, evalúa la *primera caída con recuperación*, muestra candidatos con su evidencia y mide el resultado de las señales con una **cartera simulada**. Sin candidatos o sin presupuesto, el panel dice **sin entrada** y explica por qué.
 
-- Especificación funcional: [CONTENIDO.md](CONTENIDO.md) · Arquitectura: [ARQUITECTURA.md](ARQUITECTURA.md)
+- Especificación funcional: [CONTENIDO.md](docs/CONTENIDO.md) · Arquitectura: [ARQUITECTURA.md](docs/ARQUITECTURA.md) · Ejecución real (plan por etapas): [README_BOT_ENTRADA_SALIDA.md](docs/README_BOT_ENTRADA_SALIDA.md)
 - **Solo lectura on-chain.** Ningún componente firma ni envía transacciones. Las operaciones son asientos internos del simulador.
 - Los resultados simulados **no son evidencia de rentabilidad**. El modo `fixtures` usa datos sintéticos y los umbrales no están calibrados con datos reales.
 
@@ -97,7 +97,7 @@ Panel en http://localhost:3001 y API en http://localhost:8001/docs. `RPC_MAX_RPS
 3. **Filtros obligatorios** (cada uno deja motivo, valor y umbral): migración verificada, identidad mint–pool, edad, datos frescos, concentración evaluable y aceptable, patrón confirmado, compradores netos, profundidad, estabilidad de liquidez, ruta de compra y venta, cotización vigente y costo de ida y vuelta.
 4. **Puntaje** 0–100 sin redondear: recuperación 40 % · liquidez 30 % · costo 20 % · holders 10 %, con rangos fijos por versión (no depende de otros candidatos). Desempate por costo y por frescura de la cotización.
 5. **Simulación.** Reserva de capital al admitir la señal → entrada con cotización nueva tras el retraso (rechazo registrado si cambió precio, ruta o costo) → valoración conservadora → salida por invalidación, deterioro de liquidez, objetivo o tiempo máximo. Una venta fallida **deja la posición abierta**, registra la causa, actualiza la valoración y reintenta tras una espera creciente con más tolerancia de slippage. Cada intento se compara con la cotización tomada al programarlo (el precio que disparó la salida queda registrado en el primero). Una posición sin ruta se muestra aparte con escenario de recuperación cero.
-6. **Evaluación.** Dos sesiones con el mismo universo, presupuesto, retrasos y reglas: *ranking por puntaje* contra *referencia por liquidez*. Si ambas admiten la misma señal en el mismo ciclo, entran con **la misma cotización** y en el mismo instante; cada intento de entrada guarda en `detail.timing` cuándo apareció la señal, cuándo tocaba cotizar, cuándo se pidió la cotización y cuándo llegó. PnL neto en SOL y USD, expectativa, tasa de acierto, caída máxima del PnL realizado, PnL sin la mejor operación, escenario adverso, posiciones con salida fallida y bloque cronológico (`since`/`until`).
+6. **Evaluación.** Dos sesiones con el mismo universo, presupuesto, retrasos y reglas: *ranking por puntaje* contra *referencia por liquidez*. Si ambas admiten la misma señal en el mismo ciclo, entran con **la misma cotización** y en el mismo instante; cada intento de entrada guarda en `detail.timing` cuándo apareció la señal, cuándo tocaba cotizar, cuándo se pidió la cotización y cuándo llegó. Las posiciones del mismo token y la misma cantidad que se revisan juntas comparten también la cotización de salida; si una vende sola, el intento guarda el motivo en `detail.separate_quote_reason`. El informe de `scripts/medir_live.py` cuenta además en cuántos ciclos el orden de selección hizo que las sesiones eligieran distinto. PnL neto en SOL y USD, expectativa, tasa de acierto, caída máxima del PnL realizado, PnL sin la mejor operación, escenario adverso, posiciones con salida fallida y bloque cronológico (`since`/`until`).
 
    **Cómo leer el resultado de una sesión.** El panel muestra tres cifras con el mismo peso: *PnL realizado* (solo ventas ya ejecutadas), *Abiertas valoradas* y *Total valorado* (la suma). Las abiertas se valoran de forma conservadora: las que tienen ruta de salida, vendidas al mínimo garantizado y después de costos; las que no tienen ruta, a recuperación cero (pérdida del monto entero). Debajo se informa también la cota optimista (a precio cotizado) y la hora de la valoración más vieja. La *caída máxima del PnL realizado* se calcula solo con operaciones cerradas, por eso no incluye la pérdida latente de las abiertas; para ver ese riesgo mirá *Abiertas valoradas*. (Los documentos de especificación la llaman «caída máxima del capital»: el nombre se cambió a propósito para que no sugiera algo que el cálculo no hace.)
 
@@ -106,6 +106,17 @@ Estados de candidato: `observing`, `pending_data`, `eligible`, `rejected`, `expi
 ### Configuración versionada
 
 Cada versión fija ventanas, umbrales, montos, costos máximos, caducidades y pesos ([config.py](backend/app/domain/config.py)). Es **inmutable**: reutilizar un nombre con otro contenido falla; para cambiar umbrales creá un archivo nuevo (p. ej. `backend/config/mi-estrategia-v2.json`) y apuntá `STRATEGY_CONFIG_PATH`. Los valores de [strategy-fixtures-v1.json](backend/config/strategy-fixtures-v1.json) son de fixtures: calibrá con observaciones reales y congelalos antes de la evaluación fuera de muestra.
+
+## Ejecución de órdenes (etapa 1: proveedor falso)
+
+**El sistema no opera con dinero real.** `EXECUTION_MODE` solo admite `paper`; con `manual` o `auto` el worker no arranca. Existe la base del ejecutor, probada con un proveedor falso (`backend/tests/fake_gateway.py`) y **sin conectar al worker**: no hay billetera, claves, órdenes de Jupiter ni envíos a Solana.
+
+- **Una intención por compra o venta**, creada en PostgreSQL con la billetera bloqueada: una compra por billetera y señal, una venta sin resolver por posición.
+- **Reclamo antes de llamar al proveedor.** Cada reclamo tiene un número creciente que toda escritura verifica: dos workers no piden ni firman la misma orden, y el que pierde el reclamo no puede enviar.
+- **La firma se guarda antes de enviar.** Solo la cadena la cierra (confirmada, fallida o vencida); mientras tanto se reenvía esa misma transacción y no se prepara otra.
+- Una confirmación que no coincide con la orden pausa las compras y no contabiliza nada. Una venta fallida conserva la posición, reintenta con espera creciente y, agotado el presupuesto, queda en `needs_attention`.
+
+Código en `backend/app/application/execution/` y `backend/app/domain/execution.py`; tablas `execution_*` y `live_*` (migración `0002`). Todavía falta: adaptador real de órdenes, firma aislada, consumidor propio en el worker, valoración de posiciones reales, resolución de `needs_attention`, control de salud de fuentes antes de comprar, API y panel.
 
 ## API
 
@@ -160,7 +171,7 @@ compose.yaml  .env.example
 ## Verificación realizada y límites conocidos
 
 **Verificado en este entorno**
-- 241 pruebas automáticas: reglas de dominio, flujo completo con fixtures (migración → señal → posición → PnL), API, migraciones (`upgrade`, `check` sin diferencias y `downgrade`), **PostgreSQL real** (tipos `NUMERIC(40,0)`/`JSONB`, enteros u64 exactos, cuatro workers compitiendo por las mismas señales, reclamos con `SKIP LOCKED`) y **transacciones reales de mainnet** capturadas como fixtures (`backend/tests/fixtures/solana_real/`).
+- 281 pruebas automáticas: reglas de dominio, flujo completo con fixtures (migración → señal → posición → PnL), API, migraciones (`upgrade`, `check` sin diferencias y `downgrade`), **PostgreSQL real** (tipos `NUMERIC(40,0)`/`JSONB`, enteros u64 exactos, cuatro workers compitiendo por las mismas señales, reclamos con `SKIP LOCKED`) y **transacciones reales de mainnet** capturadas como fixtures (`backend/tests/fixtures/solana_real/`).
 - Frontend: chequeo de tipos, build de producción y revisión visual con capturas (tema oscuro, claro y 500 px de ancho).
 - **`docker compose up --build` en Windows con Docker 26:** las imágenes se construyen, `migrate` aplica Alembic sobre PostgreSQL 16, y `db`, `api` y `web` quedan `healthy`. La reproducción de fixtures sobre ese PostgreSQL dio el mismo resultado exacto que las pruebas con SQLite.
 - **Modo `live` en solo lectura contra Solana y Jupiter reales** (2026-11-25, RPC público de Solana y Jupiter sin clave, base SQLite descartable). Se siguió una migración real de punta a punta con los adaptadores del sistema: firma → evento de migración → verificación on-chain del pool (cuenta real en PumpSwap, PDA canónica) → snapshots de mercado por ventanas → cotización de compra y de salida en Jupiter. Durante unos 12 minutos el worker detectó 13 migraciones reales por WebSocket y por reconciliación, y registró una evaluación real. Esa prueba encontró y corrigió defectos que las respuestas sintéticas no mostraban:
@@ -176,7 +187,7 @@ compose.yaml  .env.example
 
 **No verificado (decílo antes de confiar en ello)**
 - **Los PnL medidos hasta el 2026-11-26 no valen:** se obtuvieron con el precio sin reserva virtual y con reintentos de salida contra la referencia del primer disparo. Ambos defectos se corrigieron después. Una corrida de 1 h con las correcciones confirmó el precio (cotización de venta / precio ≈ 0,98) y mostró una salida con dos reintentos que cerró; falta una corrida larga.
-- **Comparación Ranking / Liquidez:** la entrada ya se comparte, pero **las salidas se cotizan y ejecutan por separado**, así que una diferencia entre sesiones todavía puede venir del momento de la venta. En las corridas hasta el 2026-11-27 tampoco se compartía la entrada.
+- **Comparación Ranking / Liquidez:** las cotizaciones de entrada y salida compartidas están probadas solo con pruebas automáticas, sin corrida en vivo (las corridas hasta el 2026-11-27 no las tenían). Medir qué aporta el Ranking requiere ciclos en los que haya menos lugares que señales.
 - **Retraso de ejecución:** entradas y salidas esperan al paso de evaluación del ciclo; con 5 s configurados se midieron medianas de 10 a 15 s.
 - **Concentración de holders:** se vieron valores imposibles (más de 100 %); el filtro necesita revisión.
 - Los umbrales de `live-v1` no están calibrados y los resultados de fixtures son sintéticos: ninguno es evidencia de rentabilidad.

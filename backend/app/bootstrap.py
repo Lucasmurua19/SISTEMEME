@@ -83,7 +83,16 @@ def build_fixture_sources(library: FixtureLibrary, clock: Clock):
     )
 
 
+def check_execution_mode(settings: Settings) -> None:
+    """Impide arrancar creyendo que se opera con dinero real: todavía no hay ningún ejecutor real."""
+    if settings.execution_mode != "paper":
+        raise RuntimeError(
+            f"EXECUTION_MODE={settings.execution_mode} todavía no está disponible: solo existe la simulación (paper)"
+        )
+
+
 def build_worker(settings: Settings) -> tuple[Worker, dict[str, Any]]:
+    check_execution_mode(settings)
     engine = make_engine(settings.database_url)
     uow = uow_factory(make_session_factory(engine))
     cfg = load_strategy(settings)

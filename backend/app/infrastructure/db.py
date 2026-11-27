@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.infrastructure import repositories as repo
+from app.infrastructure.execution_repo import ExecutionRepo
 
 
 def make_engine(url: str, *, echo: bool = False) -> Engine:
@@ -53,6 +54,7 @@ class SqlUnitOfWork:
         self.attempts = repo.AttemptRepo(s)
         self.ledger = repo.LedgerRepo(s)
         self.jobs = repo.JobRepo(s)
+        self.execution = ExecutionRepo(s)
         return self
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:

@@ -742,6 +742,10 @@ class PositionRepo:
             setattr(row, key, value)
         row.updated_at = now
 
+    def list_for_signal(self, signal_id: int) -> list[PositionInfo]:
+        stmt = select(orm.PaperPosition).where(orm.PaperPosition.signal_id == signal_id).order_by(orm.PaperPosition.id)
+        return [_position(r) for r in self.s.scalars(stmt)]
+
     def list(self, statuses: Iterable[PositionStatus], session_id: int | None = None) -> list[PositionInfo]:
         stmt = select(orm.PaperPosition).where(orm.PaperPosition.status.in_([s.value for s in statuses]))
         if session_id is not None:
@@ -798,6 +802,20 @@ class AttemptRepo:
                 orm.PaperAttempt.status == AttemptStatus.PENDING.value,
             )
             .order_by(orm.PaperPosition.session_id)
+        )
+        return [(session_id, attempt_id) for session_id, attempt_id, due in rows if due == scheduled_at]
+
+    def exit_batch(self, pool: str, scheduled_at: datetime) -> list[tuple[int, int]]:
+        """``(sesión, intento)`` de las salidas pendientes sobre un pool programadas para ese instante, por sesión."""
+        rows = self.s.execute(
+            select(orm.PaperPosition.session_id, orm.PaperAttempt.id, orm.PaperAttempt.scheduled_at)
+            .join(orm.PaperPosition, orm.PaperPosition.id == orm.PaperAttempt.position_id)
+            .where(
+                orm.PaperPosition.pool == pool,
+                orm.PaperAttempt.kind == AttemptKind.EXIT.value,
+                orm.PaperAttempt.status == AttemptStatus.PENDING.value,
+            )
+            .order_by(orm.PaperPosition.session_id, orm.PaperAttempt.id)
         )
         return [(session_id, attempt_id) for session_id, attempt_id, due in rows if due == scheduled_at]
 

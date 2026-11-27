@@ -5,6 +5,7 @@ name: radar-solana
 x-backend-env: &backend-env
   DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-radar}:${POSTGRES_PASSWORD:-radar}@db:5432/${POSTGRES_DB:-radar}
   DATA_MODE: ${DATA_MODE:-fixtures}
+  EXECUTION_MODE: ${EXECUTION_MODE:-paper}
   SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
   SOLANA_WS_URL: ${SOLANA_WS_URL:-}
   JUPITER_API_KEY: ${JUPITER_API_KEY:-}
